@@ -4,7 +4,8 @@ WORKDIR /app/frontend
 
 COPY frontend/package*.json ./
 RUN npm ci
-
+RUN mkdir -p /app/backend/data
+RUN chown -R 1000:1000 /app/backend/data
 COPY frontend/ .
 RUN npm run build
 
