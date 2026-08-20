@@ -1,7 +1,27 @@
+import re
 import httpx
 from typing import Optional, List, Dict
 
 TIMEOUT = httpx.Timeout(120.0)  # 120 second timeout
+
+_TMDB_PROVIDER_PATH_RE = re.compile(r"/(?:movie|tv)/(\d+)")
+
+
+def get_jellyfin_tmdb_id(provider_ids: dict) -> int | None:
+    tid = provider_ids.get("Tmdb") or provider_ids.get("tmdb")
+    if not tid:
+        return None
+    tid = str(tid)
+    if tid.isdigit():
+        return int(tid)
+    # Some Emby TMDB metadata plugins encode an episode's provider id as a
+    # relative path to its parent show/movie (e.g. "../tv/203124/season/1/episode/1")
+    # instead of a plain numeric id (see GitHub #125) - pull the id out of that
+    # instead of crashing the whole sync on int().
+    m = _TMDB_PROVIDER_PATH_RE.search(tid)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def _auth_headers(token: str) -> Dict[str, str]:
@@ -64,7 +84,7 @@ async def get_movies(library_id: str, url: str, token: str, user_id: str) -> lis
             "ParentId": library_id,
             "IncludeItemTypes": "Movie",
             "Recursive": True,
-            "Fields": "ProviderIds,MediaStreams,Overview,Genres,CommunityRating,OfficialRating,RunTimeTicks,PremiereDate,UserData",
+            "Fields": "ProviderIds,MediaStreams,Overview,Genres,CommunityRating,OfficialRating,RunTimeTicks,PremiereDate,UserData,DateCreated",
             "Limit": page_size,
             "StartIndex": start,
         })
@@ -103,7 +123,7 @@ async def get_episodes(library_id: str, url: str, token: str, user_id: str) -> l
             # never be imported into a user's collection.
             "ExcludeLocationTypes": "Virtual",
             "IsMissing": False,
-            "Fields": "ProviderIds,MediaStreams,Overview,Genres,CommunityRating,RunTimeTicks,PremiereDate,UserData",
+            "Fields": "ProviderIds,MediaStreams,Overview,Genres,CommunityRating,RunTimeTicks,PremiereDate,UserData,DateCreated",
             "Limit": page_size,
             "StartIndex": start,
         })
@@ -166,7 +186,7 @@ def extract_quality(media_streams: list) -> dict:
 
     return quality
 
-async def find_movie_by_tmdb_id(url: str, token: str, tmdb_id: int) -> Optional[Dict]:
+async def find_movie_by_tmdb_id(url: str, token: str, tmdb_id: int, user_id: Optional[str] = None) -> Optional[Dict]:
     """Search all Jellyfin libraries for a movie by TMDB ID. Returns the item with MediaStreams or None."""
     try:
         data = await _get(url, token, "Items", params={
@@ -174,18 +194,25 @@ async def find_movie_by_tmdb_id(url: str, token: str, tmdb_id: int) -> Optional[
             "IncludeItemTypes": "Movie",
             "AnyProviderIdEquals": f"Tmdb.{tmdb_id}",
             "Fields": "MediaStreams,Path,ProviderIds",
-            "Limit": 1,
+            "Limit": 25,
         })
         items = data.get("Items", [])
-        if not items:
+        # AnyProviderIdEquals doesn't reliably bind on every Jellyfin version - it
+        # can return an unrelated item as Items[0], which would then get marked
+        # watched/unwatched in this movie's place (see GitHub #247). Confirm the
+        # match against the item's own ProviderIds instead of trusting the filter.
+        match = next((i for i in items if get_jellyfin_tmdb_id(i.get("ProviderIds", {})) == tmdb_id), None)
+        if not match:
             return None
-        # Fetch full detail with MediaStreams
-        return await get_item(url, token, items[0]["Id"])
+        # Fetch full detail with MediaStreams - user_id is required here, the
+        # admin-only Items/{id} endpoint (no Users/ prefix) throws server-side
+        # for a non-admin token (see #153).
+        return await get_item(url, token, match["Id"], user_id=user_id)
     except Exception:
         return None
 
 
-async def find_episode_by_ids(url: str, token: str, series_tmdb_id: int, season: int, episode: int) -> Optional[Dict]:
+async def find_episode_by_ids(url: str, token: str, series_tmdb_id: int, season: int, episode: int, user_id: Optional[str] = None) -> Optional[Dict]:
     """Search all Jellyfin libraries for an episode by series TMDB ID + season + episode number."""
     try:
         # First find the series by TMDB ID
@@ -194,12 +221,18 @@ async def find_episode_by_ids(url: str, token: str, series_tmdb_id: int, season:
             "IncludeItemTypes": "Series",
             "AnyProviderIdEquals": f"Tmdb.{series_tmdb_id}",
             "Fields": "ProviderIds",
-            "Limit": 1,
+            "Limit": 25,
         })
         series_items = series_data.get("Items", [])
-        if not series_items:
+        # Same AnyProviderIdEquals unreliability as find_movie_by_tmdb_id (#247) -
+        # confirm the series match ourselves before searching inside it, since an
+        # unrelated series here would misattribute the episode lookup below too.
+        series_match = next(
+            (s for s in series_items if get_jellyfin_tmdb_id(s.get("ProviderIds", {})) == series_tmdb_id), None
+        )
+        if not series_match:
             return None
-        series_id = series_items[0]["Id"]
+        series_id = series_match["Id"]
 
         # Then find the episode within that series
         ep_data = await _get(url, token, "Items", params={
@@ -212,9 +245,10 @@ async def find_episode_by_ids(url: str, token: str, series_tmdb_id: int, season:
             "Limit": 1,
         })
         ep_items = ep_data.get("Items", [])
-        if not ep_items:
+        if not ep_items or ep_items[0].get("SeriesId") != series_id:
             return None
-        return await get_item(url, token, ep_items[0]["Id"])
+        # user_id required - see #153.
+        return await get_item(url, token, ep_items[0]["Id"], user_id=user_id)
     except Exception:
         return None
 
@@ -262,15 +296,29 @@ async def mark_unwatched(url: str, token: str, user_id: str, item_id: str, clien
         return False
 
 async def set_rating(url: str, token: str, user_id: str, item_id: str, rating: float, client: httpx.AsyncClient | None = None) -> bool:
-    """Set a star rating on a Jellyfin item (0–10 scale)."""
-    headers = {**_auth_headers(token), "Content-Type": "application/json"}
-    body = {"PlayedPercentage": None, "UnplayedItemCount": None, "Rating": rating}
+    """Set a star rating on a Jellyfin item (0–10 scale).
+
+    POST .../UserData replaces the *entire* UserData object rather than patching
+    it, so Played/PlayCount/PlaybackPositionTicks/IsFavorite/LastPlayedDate must
+    be fetched first and merged in - otherwise a concurrent rating push silently
+    resets watched status back to unwatched (#168).
+    """
+    get_headers = _auth_headers(token)
+    post_headers = {**get_headers, "Content-Type": "application/json"}
+    item_url = f"{url.rstrip('/')}/Users/{user_id}/Items/{item_id}"
+    userdata_url = f"{item_url}/UserData"
+
+    async def _do(c: httpx.AsyncClient) -> bool:
+        item_r = await c.get(item_url, headers=get_headers, params={"Fields": "UserData"})
+        item_r.raise_for_status()
+        body = {**item_r.json().get("UserData", {}), "Rating": rating}
+        r = await c.post(userdata_url, headers=post_headers, json=body)
+        return r.status_code < 400
+
     try:
         if client:
-            r = await client.post(f"{url.rstrip('/')}/Users/{user_id}/Items/{item_id}/UserData", headers=headers, json=body)
-            return r.status_code < 400
+            return await _do(client)
         async with httpx.AsyncClient(timeout=PUSH_TIMEOUT, follow_redirects=False) as c:
-            r = await c.post(f"{url.rstrip('/')}/Users/{user_id}/Items/{item_id}/UserData", headers=headers, json=body)
-            return r.status_code < 400
+            return await _do(c)
     except Exception:
         return False

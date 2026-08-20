@@ -108,7 +108,7 @@ async def validate_api_key(api_key: str) -> bool:
         return False
 
 
-async def get_movie(tmdb_id: int, api_key: str = None, language: str | None = None) -> dict:
+async def get_movie(tmdb_id: int, api_key: str = None, language: str | None = None, cache_ttl: float | None = DEFAULT_CACHE_TTL) -> dict:
     params: dict = {"append_to_response": "credits,release_dates,recommendations,external_ids"}
     if language:
         params["language"] = language
@@ -116,10 +116,11 @@ async def get_movie(tmdb_id: int, api_key: str = None, language: str | None = No
         f"{TMDB_BASE}/movie/{tmdb_id}",
         headers=get_headers(api_key),
         params=params,
+        cache_ttl=cache_ttl,
     )
 
 
-async def get_show(tmdb_id: int, api_key: str = None, language: str | None = None) -> dict:
+async def get_show(tmdb_id: int, api_key: str = None, language: str | None = None, cache_ttl: float | None = DEFAULT_CACHE_TTL) -> dict:
     params: dict = {"append_to_response": "credits,content_ratings,recommendations,external_ids"}
     if language:
         params["language"] = language
@@ -127,10 +128,11 @@ async def get_show(tmdb_id: int, api_key: str = None, language: str | None = Non
         f"{TMDB_BASE}/tv/{tmdb_id}",
         headers=get_headers(api_key),
         params=params,
+        cache_ttl=cache_ttl,
     )
 
 
-async def get_season(tmdb_id: int, season_number: int, api_key: str = None, language: str | None = None) -> dict:
+async def get_season(tmdb_id: int, season_number: int, api_key: str = None, language: str | None = None, cache_ttl: float | None = DEFAULT_CACHE_TTL) -> dict:
     params: dict = {}
     if language:
         params["language"] = language
@@ -138,10 +140,11 @@ async def get_season(tmdb_id: int, season_number: int, api_key: str = None, lang
         f"{TMDB_BASE}/tv/{tmdb_id}/season/{season_number}",
         headers=get_headers(api_key),
         params=params or None,
+        cache_ttl=cache_ttl,
     )
 
 
-async def get_episode(tmdb_id: int, season_number: int, episode_number: int, api_key: str = None, language: str | None = None) -> dict:
+async def get_episode(tmdb_id: int, season_number: int, episode_number: int, api_key: str = None, language: str | None = None, cache_ttl: float | None = DEFAULT_CACHE_TTL) -> dict:
     params: dict = {"append_to_response": "credits"}
     if language:
         params["language"] = language
@@ -149,6 +152,7 @@ async def get_episode(tmdb_id: int, season_number: int, episode_number: int, api
         f"{TMDB_BASE}/tv/{tmdb_id}/season/{season_number}/episode/{episode_number}",
         headers=get_headers(api_key),
         params=params,
+        cache_ttl=cache_ttl,
     )
 
 
@@ -164,12 +168,18 @@ async def get_episode_external_ids(
     )
 
 
-async def get_trending_movies(time_window: str = "day", page: int = 1, api_key: str = None) -> dict:
-    return await _get(f"{TMDB_BASE}/trending/movie/{time_window}", headers=get_headers(api_key), params={"page": page})
+async def get_trending_movies(time_window: str = "day", page: int = 1, api_key: str = None, language: str | None = None) -> dict:
+    params: dict = {"page": page}
+    if language:
+        params["language"] = language
+    return await _get(f"{TMDB_BASE}/trending/movie/{time_window}", headers=get_headers(api_key), params=params)
 
 
-async def get_trending_shows(time_window: str = "day", page: int = 1, api_key: str = None) -> dict:
-    return await _get(f"{TMDB_BASE}/trending/tv/{time_window}", headers=get_headers(api_key), params={"page": page})
+async def get_trending_shows(time_window: str = "day", page: int = 1, api_key: str = None, language: str | None = None) -> dict:
+    params: dict = {"page": page}
+    if language:
+        params["language"] = language
+    return await _get(f"{TMDB_BASE}/trending/tv/{time_window}", headers=get_headers(api_key), params=params)
 
 
 async def get_show_light(tmdb_id: int, api_key: str = None, language: str | None = None) -> dict:
@@ -192,20 +202,32 @@ async def get_on_air_today(page: int = 1, api_key: str = None, timezone: str = "
     return await _get(f"{TMDB_BASE}/tv/airing_today", headers=get_headers(api_key), params={"page": page, "timezone": timezone})
 
 
-async def get_popular_movies(page: int = 1, api_key: str = None) -> dict:
-    return await _get(f"{TMDB_BASE}/movie/popular", headers=get_headers(api_key), params={"page": page})
+async def get_popular_movies(page: int = 1, api_key: str = None, language: str | None = None) -> dict:
+    params: dict = {"page": page}
+    if language:
+        params["language"] = language
+    return await _get(f"{TMDB_BASE}/movie/popular", headers=get_headers(api_key), params=params)
 
 
-async def get_top_rated_movies(page: int = 1, api_key: str = None) -> dict:
-    return await _get(f"{TMDB_BASE}/movie/top_rated", headers=get_headers(api_key), params={"page": page})
+async def get_top_rated_movies(page: int = 1, api_key: str = None, language: str | None = None) -> dict:
+    params: dict = {"page": page}
+    if language:
+        params["language"] = language
+    return await _get(f"{TMDB_BASE}/movie/top_rated", headers=get_headers(api_key), params=params)
 
 
-async def get_popular_shows(page: int = 1, api_key: str = None) -> dict:
-    return await _get(f"{TMDB_BASE}/tv/popular", headers=get_headers(api_key), params={"page": page})
+async def get_popular_shows(page: int = 1, api_key: str = None, language: str | None = None) -> dict:
+    params: dict = {"page": page}
+    if language:
+        params["language"] = language
+    return await _get(f"{TMDB_BASE}/tv/popular", headers=get_headers(api_key), params=params)
 
 
-async def get_top_rated_shows(page: int = 1, api_key: str = None) -> dict:
-    return await _get(f"{TMDB_BASE}/tv/top_rated", headers=get_headers(api_key), params={"page": page})
+async def get_top_rated_shows(page: int = 1, api_key: str = None, language: str | None = None) -> dict:
+    params: dict = {"page": page}
+    if language:
+        params["language"] = language
+    return await _get(f"{TMDB_BASE}/tv/top_rated", headers=get_headers(api_key), params=params)
 
 
 async def search_multi(q: str, page: int = 1, api_key: str = None, language: str | None = None) -> dict:
@@ -282,6 +304,7 @@ async def get_show_recommendations(show_id: int, api_key: str = None) -> dict:
 async def discover_movies(
     page: int = 1,
     genre_id: int | None = None,
+    genre_ids: list[int] | None = None,  # OR'd via TMDB's "|" syntax; takes priority over genre_id if both given
     year: int | None = None,
     min_rating: float | None = None,
     vote_count_min: int | None = None,
@@ -291,6 +314,7 @@ async def discover_movies(
     watch_region: str = "US",
     with_original_language: str | None = None,
     api_key: str = None,
+    language: str | None = None,
 ) -> dict:
     params: dict = {
         "page": page,
@@ -298,7 +322,9 @@ async def discover_movies(
         "include_adult": "false",
         "vote_count.gte": vote_count_min if vote_count_min is not None else 50,
     }
-    if genre_id:
+    if genre_ids:
+        params["with_genres"] = "|".join(str(g) for g in genre_ids)
+    elif genre_id:
         params["with_genres"] = genre_id
     if year:
         params["primary_release_year"] = year
@@ -311,12 +337,15 @@ async def discover_movies(
         params["watch_region"] = watch_region
     if with_original_language:
         params["with_original_language"] = with_original_language
+    if language:
+        params["language"] = language
     return await _get(f"{TMDB_BASE}/discover/movie", headers=get_headers(api_key), params=params)
 
 
 async def discover_shows(
     page: int = 1,
     genre_id: int | None = None,
+    genre_ids: list[int] | None = None,  # OR'd via TMDB's "|" syntax; takes priority over genre_id if both given
     year: int | None = None,
     min_rating: float | None = None,
     vote_count_min: int | None = None,
@@ -327,6 +356,7 @@ async def discover_shows(
     watch_region: str = "US",
     with_original_language: str | None = None,
     api_key: str = None,
+    language: str | None = None,
 ) -> dict:
     params: dict = {
         "page": page,
@@ -334,7 +364,9 @@ async def discover_shows(
         "include_adult": "false",
         "vote_count.gte": vote_count_min if vote_count_min is not None else 50,
     }
-    if genre_id:
+    if genre_ids:
+        params["with_genres"] = "|".join(str(g) for g in genre_ids)
+    elif genre_id:
         params["with_genres"] = genre_id
     if year:
         params["first_air_date_year"] = year
@@ -349,6 +381,8 @@ async def discover_shows(
         params["watch_region"] = watch_region
     if with_original_language:
         params["with_original_language"] = with_original_language
+    if language:
+        params["language"] = language
     return await _get(f"{TMDB_BASE}/discover/tv", headers=get_headers(api_key), params=params)
 
 

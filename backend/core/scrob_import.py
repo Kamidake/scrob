@@ -203,6 +203,17 @@ def _parse_iso(value: str | None) -> datetime | None:
     return parsed
 
 
+def _parse_collected_at(entry: dict) -> datetime | None:
+    """The collected date the exporter wrote for this entry, if it is usable.
+
+    A malformed date shouldn't cost the user the whole entry, so it falls back
+    to None and the row keeps its default."""
+    try:
+        return _parse_iso(entry.get("collected_at"))
+    except (TypeError, ValueError):
+        return None
+
+
 async def apply_scrob_import(
     db: AsyncSession,
     job_id: int,
@@ -406,12 +417,14 @@ async def apply_scrob_import(
 
     # ── Collection ─────────────────────────────────────────────────────
     if include_collection:
-        async def _add_to_collection(media: Media) -> bool:
+        async def _add_to_collection(media: Media, collected_at: datetime | None = None) -> bool:
             existing = await db.execute(select(Collection).where(Collection.user_id == user_id, Collection.media_id == media.id))
             coll = existing.scalars().first()
             if coll:
                 return False
-            coll = Collection(user_id=user_id, media_id=media.id)
+            # Keep the exported collected date, otherwise restoring a backup
+            # silently restamps the whole collection as added today.
+            coll = Collection(user_id=user_id, media_id=media.id, added_at=collected_at)
             db.add(coll)
             await db.flush()
             db.add(CollectionFile(collection_id=coll.id, source=CollectionSource.manual, source_id=str(media.tmdb_id)))
@@ -426,7 +439,7 @@ async def apply_scrob_import(
                 try:
                     async with db.begin_nested():
                         media = await _get_or_create_movie_media(db, tmdb_id, entry.get("movie", {}).get("title", ""), api_key)
-                        if media and await _add_to_collection(media):
+                        if media and await _add_to_collection(media, _parse_collected_at(entry)):
                             stats["collected"] += 1
                         else:
                             stats["skipped"] += 1
@@ -457,7 +470,7 @@ async def apply_scrob_import(
                             stats["errors"] += 1
                             continue
                         media = await _get_or_create_episode_media(db, show.id, show_tmdb_id, season_number, episode_number, api_key, season_cache)
-                        if media and await _add_to_collection(media):
+                        if media and await _add_to_collection(media, _parse_collected_at(entry)):
                             stats["collected"] += 1
                         else:
                             stats["skipped"] += 1
@@ -567,11 +580,21 @@ async def apply_scrob_import(
             if key in existing_comment_keys:
                 stats["skipped"] += 1
                 return
+            try:
+                # Unlike the watched/ratings/collection/lists sections above,
+                # a malformed created_at here (plausible from a hand-edited or
+                # third-party CSV, unlike Trakt's own well-formed dates) must
+                # only drop this one comment, not abort the whole import.
+                created_at = _parse_iso(entry.get("created_at")) or datetime.utcnow()
+            except ValueError:
+                logger.exception("Error importing comment (media_type=%s tmdb_id=%s)", media_type, tmdb_id)
+                stats["errors"] += 1
+                return
             db.add(Comment(
                 user_id=user_id, media_type=media_type, tmdb_id=tmdb_id,
                 season_number=season_number, episode_number=episode_number,
                 content=content, is_spoiler=bool(entry.get("spoiler")),
-                created_at=_parse_iso(entry.get("created_at")) or datetime.utcnow(),
+                created_at=created_at,
             ))
             existing_comment_keys.add(key)
             stats["comments"] += 1

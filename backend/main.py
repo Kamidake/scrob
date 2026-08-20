@@ -9,7 +9,10 @@ from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession
 from db import engine, Base
 import models # noqa: F401
-from routers import webhooks, media, history, ratings, sync, shows, auth, lists, oidc, profile, trakt, simkl, mdblist, comments, admin, compat, export
+from routers import webhooks, media, history, ratings, sync, shows, auth, lists, oidc, profile, trakt, simkl, mdblist, bingebase, comments, admin, compat, export, yamtrack, calendar
+
+from core.access_log import install as install_access_log_redaction
+install_access_log_redaction()
 
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -132,15 +135,7 @@ async def _auto_sync_scheduler():
                     schedules: list[tuple[str, float, object]] = []
                     if conn.auto_sync_interval is not None:
                         schedules.append(("pull", conn.auto_sync_interval, pull_runner))
-                    if (
-                        conn.auto_push_interval is not None
-                        and (
-                            conn.push_collection
-                            or conn.push_watched
-                            or conn.push_playback
-                            or conn.push_ratings
-                        )
-                    ):
+                    if conn.auto_push_interval is not None and conn.push_enabled:
                         schedules.append(("push", conn.auto_push_interval, _run_full_push))
 
                     due: list[tuple[datetime, str, object]] = []
@@ -296,6 +291,82 @@ async def _manual_session_completer():
                 await auto_complete_manual_sessions(db)
         except Exception as e:
             print(f"Manual session completer error: {e}")
+
+
+async def _emby_progress_poller():
+    """Emby's webhook system has no progress event (only start/pause/unpause/
+    stop), so a PlaybackSession opened by an Emby webhook freezes at the last
+    event's position until the next one (#240). Jellyfin doesn't need this:
+    its Webhook plugin can send PlaybackProgress, which /webhook/jellyfin
+    already handles.
+
+    Polls the Emby Sessions API for connections with playback sync enabled and
+    refreshes the progress/state of sessions the webhooks already opened.
+    Sessions without a matching PlaybackSession row are ignored, so the
+    webhook flow stays the source of truth."""
+    import logging
+    log = logging.getLogger("uvicorn.error")
+
+    try:
+        import httpx
+        from datetime import datetime
+        from db import AsyncSessionLocal
+        from models.connections import MediaServerConnection
+    except Exception as e:
+        log.error(f"Emby progress poller: failed to import dependencies: {e}")
+        return
+
+    POLL_INTERVAL = 60
+    log.info("Emby progress poller: started")
+
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+        try:
+            async with AsyncSessionLocal() as db:
+                conns = (await db.execute(
+                    select(MediaServerConnection).where(
+                        MediaServerConnection.type == "emby",
+                        MediaServerConnection.sync_playback.is_(True),
+                    )
+                )).scalars().all()
+                for conn in conns:
+                    try:
+                        async with httpx.AsyncClient(timeout=10.0) as client:
+                            resp = await client.get(
+                                f"{conn.url.rstrip('/')}/Sessions",
+                                headers={"X-Emby-Token": conn.token},
+                            )
+                            resp.raise_for_status()
+                            sessions = resp.json()
+                    except Exception:
+                        continue
+                    for s in sessions:
+                        item = s.get("NowPlayingItem") or {}
+                        play_state = s.get("PlayState") or {}
+                        runtime = item.get("RunTimeTicks") or 0
+                        position = play_state.get("PositionTicks") or 0
+                        if not runtime or not position:
+                            continue
+                        key = f"emby:{conn.user_id}:{s.get('Id')}"
+                        row = (await db.execute(
+                            select(PlaybackSession).where(PlaybackSession.session_key == key)
+                        )).scalar_one_or_none()
+                        if not row:
+                            continue
+                        row.progress_percent = round(position / runtime, 4)
+                        row.progress_seconds = int(position / 10_000_000)
+                        row.state = "paused" if play_state.get("IsPaused") else "playing"
+                        row.updated_at = datetime.utcnow()
+                        # Commit per-row via the shared helper (routers/webhooks.py):
+                        # a PlaybackStop webhook can delete this same session between
+                        # the select above and this write, which SQLAlchemy surfaces
+                        # as a StaleDataError. Batching every session into one final
+                        # commit would let that one race discard every other Emby
+                        # session's progress for this whole poll cycle - tolerating
+                        # it per-row keeps the blast radius to just that session.
+                        await webhooks._commit_playback_session_update(db)
+        except Exception as e:
+            log.error(f"Emby progress poller: {e}")
 
 
 async def _watchlist_poller():
@@ -457,12 +528,14 @@ async def lifespan(app: FastAPI):
     scheduler_task = asyncio.create_task(_auto_sync_scheduler())
     watchlist_task = asyncio.create_task(_watchlist_poller())
     manual_session_task = asyncio.create_task(_manual_session_completer())
+    emby_progress_task = asyncio.create_task(_emby_progress_poller())
 
     yield
 
     scheduler_task.cancel()
     watchlist_task.cancel()
     manual_session_task.cancel()
+    emby_progress_task.cancel()
     try:
         await scheduler_task
     except asyncio.CancelledError:
@@ -473,6 +546,10 @@ async def lifespan(app: FastAPI):
         pass
     try:
         await manual_session_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await emby_progress_task
     except asyncio.CancelledError:
         pass
 
@@ -526,9 +603,12 @@ app.include_router(profile.router, prefix="/profile", tags=["profile"])
 app.include_router(trakt.router, prefix="/trakt", tags=["trakt"])
 app.include_router(simkl.router, prefix="/simkl", tags=["simkl"])
 app.include_router(mdblist.router, prefix="/mdblist", tags=["mdblist"])
+app.include_router(bingebase.router, prefix="/bingebase", tags=["bingebase"])
 app.include_router(comments.router, prefix="/comments", tags=["comments"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
 app.include_router(export.router, prefix="/export", tags=["export"])
+app.include_router(yamtrack.router, prefix="/yamtrack", tags=["yamtrack"])
+app.include_router(calendar.router, prefix="/calendar", tags=["calendar"])
 app.include_router(compat.router, tags=["compat"])
 
 @app.get("/health")

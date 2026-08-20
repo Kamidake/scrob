@@ -13,7 +13,7 @@ class MediaServerConnection(Base):
 
     id               : Mapped[int]           = mapped_column(Integer, primary_key=True)
     user_id          : Mapped[int]           = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    type             : Mapped[str]           = mapped_column(String(50), nullable=False)   # plex | jellyfin | emby | nuvio | stremio
+    type             : Mapped[str]           = mapped_column(String(50), nullable=False)   # plex | jellyfin | emby | nuvio | stremio | arvio
     name             : Mapped[str]           = mapped_column(String(255), nullable=False)
     url              : Mapped[str]           = mapped_column(String(500), nullable=False)
     token            : Mapped[str]           = mapped_column(String(500), nullable=False)
@@ -51,8 +51,28 @@ class MediaServerConnection(Base):
     # Plex watchlist ↔ Scrob list sync (Plex connections only)
     plex_sync_watchlist : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     plex_push_watchlist : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Typed keys ("movie:603") on the Plex watchlist as of the last successful
+    # reconcile; NULL = never reconciled, so deletions are never inferred.
+    # Unrelated to watchlist_synced_ids above (the Radarr/Sonarr request cache).
+    plex_watchlist_synced_keys : Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
 
     # Plex per-play watch history backfill cursor (Plex connections only)
     plex_history_cursor_at : Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     created_at       : Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    @property
+    def push_enabled(self) -> bool:
+        """Whether this connection has any Scrob → server push direction enabled.
+
+        Single source of truth for the auto-push scheduler and the manual push
+        endpoint, so a newly added push flag can't be forgotten in one of them
+        again (plex_push_watchlist was, leaving watchlist-only connections
+        without auto-push)."""
+        return bool(
+            self.push_collection
+            or self.push_watched
+            or self.push_playback
+            or self.push_ratings
+            or self.plex_push_watchlist
+        )

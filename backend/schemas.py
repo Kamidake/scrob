@@ -85,6 +85,8 @@ class UserSettings(BaseModel):
     radarr_root_folder: Optional[str] = None
     radarr_quality_profile: Optional[int] = None
     radarr_tags: Optional[list[int]] = None
+    radarr_customize_on_add: Optional[bool] = None
+    has_effective_radarr: bool = False  # read-only, user-or-global config fully set
 
     # Sonarr integration
     sonarr_url: Optional[str] = None
@@ -93,6 +95,8 @@ class UserSettings(BaseModel):
     sonarr_quality_profile: Optional[int] = None
     sonarr_tags: Optional[list[int]] = None
     sonarr_season_folder: Optional[bool] = None
+    sonarr_customize_on_add: Optional[bool] = None
+    has_effective_sonarr: bool = False  # read-only, user-or-global config fully set
 
     # Trakt — app credentials + sync flags; OAuth tokens managed via /trakt/* endpoints
     trakt_client_id: Optional[str] = None
@@ -136,6 +140,14 @@ class UserSettings(BaseModel):
     mdblist_auto_sync_interval: Optional[float] = None
     mdblist_auto_push_interval: Optional[float] = None
 
+    # Bingebase integration
+    bingebase_webhook_url: Optional[str] = None
+    bingebase_api_key: Optional[str] = None
+    bingebase_connected: Optional[bool] = None  # read-only, derived from webhook_url presence
+    bingebase_scrobble: Optional[bool] = None
+    bingebase_push_watched: Optional[bool] = None
+    bingebase_push_ratings: Optional[bool] = None
+
     preferences: Optional[dict] = None
     blur_explicit: Optional[bool] = None
     time_format_24h: Optional[bool] = None
@@ -158,6 +170,20 @@ class NuvioConnectionTestRequest(BaseModel):
     url: str
     token: str
     profile_id: int
+
+
+class ArvioLoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+    url: str = "https://auth.arvio.tv/.netlify/functions"
+    app_key: Optional[str] = None
+
+
+class ArvioConnectionTestRequest(BaseModel):
+    url: str
+    token: str
+    profile_id: str
+    app_key: Optional[str] = None
 
 
 class ApiKeyTestRequest(BaseModel):
@@ -243,8 +269,8 @@ class MediaServerConnectionResponse(MediaServerConnectionBase):
     created_at: datetime
 
     @model_validator(mode="after")
-    def redact_stremio_auth_key(self):
-        if self.type == "stremio":
+    def redact_cloud_credentials(self):
+        if self.type in ("stremio", "arvio"):
             self.token = ""
         return self
 
@@ -386,9 +412,11 @@ class GlobalSettings(BaseModel):
     sonarr_season_folder        : bool = True
     radarr_require_approval     : bool = False
     sonarr_require_approval     : bool = False
+    radarr_customize_on_add     : bool = False
+    sonarr_customize_on_add     : bool = False
     image_cache_enabled         : bool = False
     image_cache_limit_gb        : Optional[int] = None
-    allow_public_profiles       : bool = False
+    enable_logged_out_navigation: bool = False
 
     class Config:
         from_attributes = True

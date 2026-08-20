@@ -13,6 +13,7 @@ from typing import Optional
 from jose import jwt, JWTError
 
 from db import get_db
+from models.base import UserRole
 from models.users import User, UserSettings, TotpBackupCode
 from models.global_settings import GlobalSettings
 from models.connections import MediaServerConnection
@@ -180,7 +181,12 @@ async def register(request: Request, user_in: schemas.UserCreate, db: AsyncSessi
         username=user_in.username,
         password_hash=get_password_hash(user_in.password),
         api_key=_generate_api_key(),
-        role=user_in.role,
+        # Never take the role from the request body: role == "admin" grants
+        # elevated access in several routers independently of is_admin, so a
+        # self-registering user could escalate by posting {"role": "admin"}.
+        # The first user is the bootstrap admin, so it gets both is_admin and
+        # the admin role (some routers check role, others is_admin).
+        role=UserRole.admin if is_first_user else UserRole.user,
         is_admin=is_first_user,
         email_confirmed=email_confirmed,
     )
@@ -352,12 +358,24 @@ async def _settings_response(settings: UserSettings, db: AsyncSession) -> schema
     data.trakt_connected = bool(settings.trakt_access_token)
     data.simkl_connected = bool(settings.simkl_access_token)
     data.mdblist_connected = bool(settings.mdblist_api_key)
+    data.bingebase_connected = bool(settings.bingebase_webhook_url or settings.bingebase_api_key)
     gs_result = await db.execute(select(GlobalSettings).where(GlobalSettings.id == 1))
     gs = gs_result.scalar_one_or_none()
     data.has_global_tmdb_key = bool(gs and gs.tmdb_api_key)
     data.has_effective_tmdb_key = bool(settings.tmdb_api_key) or data.has_global_tmdb_key
     data.has_global_tvdb_key = bool(gs and gs.tvdb_api_key)
     data.has_effective_tvdb_key = bool(settings.tvdb_api_key) or data.has_global_tvdb_key
+    # Same "all 4 fields set, user config first" rule as _effective_radarr/
+    # _effective_sonarr in routers/media.py - inlined rather than imported to
+    # avoid a routers.media <-> routers.auth cross-import.
+    data.has_effective_radarr = bool(
+        all([settings.radarr_url, settings.radarr_token, settings.radarr_root_folder, settings.radarr_quality_profile])
+        or (gs and all([gs.radarr_url, gs.radarr_token, gs.radarr_root_folder, gs.radarr_quality_profile]))
+    )
+    data.has_effective_sonarr = bool(
+        all([settings.sonarr_url, settings.sonarr_token, settings.sonarr_root_folder, settings.sonarr_quality_profile])
+        or (gs and all([gs.sonarr_url, gs.sonarr_token, gs.sonarr_root_folder, gs.sonarr_quality_profile]))
+    )
     return data
 
 
@@ -396,7 +414,7 @@ async def update_user_settings(
         db.add(settings)
 
     # Computed read-only fields; never write them back
-    READ_ONLY_FIELDS = {"trakt_connected", "simkl_connected", "mdblist_connected", "has_global_tmdb_key", "has_effective_tmdb_key", "has_global_tvdb_key", "has_effective_tvdb_key"}
+    READ_ONLY_FIELDS = {"trakt_connected", "simkl_connected", "mdblist_connected", "bingebase_connected", "has_global_tmdb_key", "has_effective_tmdb_key", "has_global_tvdb_key", "has_effective_tvdb_key"}
     update_data = {k: v for k, v in settings_in.model_dump(exclude_unset=True).items() if k not in READ_ONLY_FIELDS}
 
     if "tmdb_api_key" in update_data and update_data["tmdb_api_key"]:
@@ -415,7 +433,7 @@ async def update_user_settings(
         if not await mdblist.validate_api_key(update_data["mdblist_api_key"]):
             raise HTTPException(status_code=400, detail="Invalid MDBList API key")
 
-    url_fields = {"radarr_url": "Radarr URL", "sonarr_url": "Sonarr URL"}
+    url_fields = {"radarr_url": "Radarr URL", "sonarr_url": "Sonarr URL", "bingebase_webhook_url": "Bingebase Webhook URL"}
     for field, label in url_fields.items():
         if field in update_data and update_data[field]:
             update_data[field] = await validate_service_url(update_data[field], label)
@@ -450,10 +468,10 @@ async def create_connection(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if body.type not in ("plex", "jellyfin", "emby", "nuvio", "stremio"):
+    if body.type not in ("plex", "jellyfin", "emby", "nuvio", "stremio", "arvio"):
         raise HTTPException(
             status_code=400,
-            detail="type must be plex, jellyfin, emby, nuvio, or stremio",
+            detail="type must be plex, jellyfin, emby, nuvio, stremio, or arvio",
         )
     validated_url = body.url
     connection_token = body.token
@@ -493,8 +511,21 @@ async def create_connection(
         connection_token = session.refresh_token
         server_user_id = str(profile_id)
         server_username = _nuvio_profile_name(profiles, profile_id)
+    elif body.type == "arvio":
+        from core import arvio
 
-    cloud_media_provider = body.type in ("nuvio", "stremio")
+        profile_id = str(server_user_id or "")
+        if not profile_id:
+            raise HTTPException(status_code=400, detail="ARVIO profile ID is required")
+        try:
+            session, profiles = await arvio.validate_connection(validated_url, connection_token, profile_id)
+        except arvio.ArvioAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        connection_token = session.refresh_token
+        server_user_id = profile_id
+        server_username = arvio.get_profile_name(profiles, profile_id)
+
+    cloud_media_provider = body.type in ("nuvio", "stremio", "arvio")
     conn = MediaServerConnection(
         user_id=current_user.id,
         type=body.type,
@@ -567,7 +598,6 @@ async def update_connection(
             from core import nuvio
 
             candidate_url = update_data.get("url", conn.url)
-            candidate_token = update_data.get("token", conn.token)
             profile_id = _parse_nuvio_profile_id(update_data.get("server_user_id", conn.server_user_id))
 
             async def _persist_refresh(session: nuvio.NuvioSession) -> None:
@@ -579,6 +609,15 @@ async def update_connection(
 
             try:
                 async with nuvio.connection_lock(conn.id):
+                    # Refresh_token is single-use and rotates on every redeem
+                    # (see core/nuvio.py's connection_lock docstring) - conn
+                    # may have been loaded before another request (e.g. the
+                    # connections page's status check) already rotated it
+                    # while this one waited for the lock. Re-read the latest
+                    # persisted value now, inside the lock, rather than reuse
+                    # whatever was loaded at request start.
+                    await db.refresh(conn)
+                    candidate_token = update_data.get("token", conn.token)
                     session, profiles = await nuvio.validate_connection(
                         candidate_url, candidate_token, profile_id, on_refresh=_persist_refresh
                     )
@@ -594,6 +633,13 @@ async def update_connection(
         else:
             update_data["push_playback"] = False
             update_data["push_collection"] = False
+
+    # Re-enabling a watchlist sync direction starts from a clean bootstrap: a
+    # baseline recorded under the old settings must not drive deletions.
+    for flag in ("plex_sync_watchlist", "plex_push_watchlist"):
+        if update_data.get(flag) and not getattr(conn, flag):
+            update_data["plex_watchlist_synced_keys"] = None
+            break
 
     for field, value in update_data.items():
         setattr(conn, field, value)
@@ -950,6 +996,45 @@ async def test_nuvio(
         "profiles": profiles,
     }
 
+
+@router.post("/arvio-login")
+async def login_arvio(
+    body: schemas.ArvioLoginRequest,
+    current_user: User = Depends(get_current_user),
+):
+    from core import arvio
+
+    url = await validate_service_url(body.url, "ARVIO URL")
+    try:
+        session, profiles = await arvio.authenticate(url, body.email, body.password, api_key=body.app_key)
+    except arvio.ArvioAPIError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "url": url,
+        "refresh_token": session.refresh_token,
+        "profiles": profiles,
+    }
+
+
+@router.post("/test-arvio")
+async def test_arvio(
+    body: schemas.ArvioConnectionTestRequest,
+    current_user: User = Depends(get_current_user),
+):
+    from core import arvio
+
+    url = await validate_service_url(body.url, "ARVIO URL")
+    try:
+        session, profiles = await arvio.validate_connection(url, body.token, body.profile_id, api_key=body.app_key)
+    except arvio.ArvioAPIError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "status": "ok",
+        "message": "ARVIO connection is valid.",
+        "refresh_token": session.refresh_token,
+        "profiles": profiles,
+    }
+
 @router.post("/test-radarr")
 async def test_radarr(
     body: schemas.ServiceConnectionTestRequest,
@@ -1062,7 +1147,7 @@ async def get_connection_status(
         return {"configured": True, "connected": connected}
 
     async def check_media_server(conn):
-        from core import jellyfin, nuvio, plex, stremio
+        from core import arvio, jellyfin, nuvio, plex, stremio
 
         try:
             if conn.type == "plex":
@@ -1071,11 +1156,30 @@ async def get_connection_status(
                 profile_id = _parse_nuvio_profile_id(conn.server_user_id)
                 # Nuvio's refresh token is single-use; the lock keeps this
                 # status check from racing another request (e.g. a second
-                # open tab) that reads and redeems the same stale token.
+                # open tab) that reads and redeems the same stale token. The
+                # lock alone isn't enough though - conn was loaded before
+                # acquiring it, so a request that already rotated the token
+                # while this one waited would still leave conn.token stale;
+                # re-read it now that the lock is held.
                 async with nuvio.connection_lock(conn.id):
+                    await db.refresh(conn)
                     session, profiles = await nuvio.validate_connection(conn.url, conn.token, profile_id)
                     conn.token = session.refresh_token
                 conn.server_username = _nuvio_profile_name(profiles, profile_id)
+                connected = True
+            elif conn.type == "arvio":
+                profile_id = conn.server_user_id if (conn.server_user_id and conn.server_user_id != "undefined") else None
+                # Same single-use rotating refresh token as Nuvio - see the
+                # comment on the Nuvio branch above. Re-read conn under the
+                # lock before redeeming its token.
+                async with arvio.connection_lock(conn.id):
+                    await db.refresh(conn)
+                    session, profiles = await arvio.validate_connection(conn.url, conn.token, profile_id)
+                    conn.token = session.refresh_token
+                if profile_id is None and profiles:
+                    conn.server_user_id = profiles[0]["id"]
+                    await db.commit()
+                conn.server_username = arvio.get_profile_name(profiles, conn.server_user_id)
                 connected = True
             elif conn.type == "stremio":
                 account = await stremio.validate_auth_key(conn.token)
@@ -1098,6 +1202,10 @@ async def get_connection_status(
                 }
                 for profile in profiles
             ]
+        elif conn.type == "arvio" and connected:
+            result["token"] = conn.token
+            result["profile_name"] = conn.server_username
+            result["profiles"] = profiles
         return result
 
     async def check_simkl():

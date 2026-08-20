@@ -21,11 +21,14 @@ class CollectionSource(str, enum.Enum):
     plex     = "plex"
     nuvio    = "nuvio"
     stremio  = "stremio"
+    arvio    = "arvio"
     trakt    = "trakt"
     simkl    = "simkl"
     mdblist  = "mdblist"
+    bingebase = "bingebase"
     manual   = "manual"
     tmdb     = "tmdb"
+    yamtrack = "yamtrack"
 
 class PrivacyLevel(str, enum.Enum):
     public       = "public"

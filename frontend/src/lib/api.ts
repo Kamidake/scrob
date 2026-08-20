@@ -182,6 +182,11 @@ export interface EpisodeDetail {
   cast: CastMember[];
   guest_stars: CastMember[];
   episodes: EpisodeItem[];
+  season?: {
+    name: string;
+    season_number: number;
+    poster_path: string | null;
+  };
   library: {
     resolution: string;
     video_codec: string;
@@ -245,7 +250,9 @@ export interface ShowSeasonOverride {
   source_show_tmdb_id: number;
   source_season_number: number;
   source_show_title: string | null;
-  target_show_tmdb_id: number;
+  target_show_tmdb_id: number | null;
+  target_show_tvdb_id: number | null;
+  target_source: "tmdb" | "tvdb";
   target_season_number: number;
   target_show_title: string | null;
 }
@@ -321,7 +328,7 @@ export interface GlobalSettings {
   sonarr_require_approval: boolean;
   image_cache_enabled: boolean;
   image_cache_limit_gb: number | null;
-  allow_public_profiles: boolean;
+  enable_logged_out_navigation: boolean;
 }
 
 export interface MediaRequestItem {
@@ -404,12 +411,14 @@ export interface UserSettings {
   radarr_root_folder: string | null;
   radarr_quality_profile: number | null;
   radarr_tags: number[] | null;
+  has_effective_radarr: boolean;
 
   sonarr_url: string | null;
   sonarr_token: string | null;
   sonarr_root_folder: string | null;
   sonarr_quality_profile: number | null;
   sonarr_tags: number[] | null;
+  has_effective_sonarr: boolean;
 
   // Trakt
   trakt_connected: boolean;
@@ -453,7 +462,7 @@ export interface UserSettings {
 export interface MediaServerConnection {
   id: number;
   user_id: number;
-  type: "jellyfin" | "emby" | "plex" | "nuvio" | "stremio";
+  type: "jellyfin" | "emby" | "plex" | "nuvio" | "stremio" | "arvio";
   name: string;
   url: string;
   token: string;
@@ -473,7 +482,7 @@ export interface MediaServerConnection {
 }
 
 export interface MediaServerConnectionCreate {
-  type: "jellyfin" | "emby" | "plex" | "nuvio" | "stremio";
+  type: "jellyfin" | "emby" | "plex" | "nuvio" | "stremio" | "arvio";
   name: string;
   url: string;
   token: string;
@@ -567,7 +576,17 @@ export interface MediaItem {
   // from TVDB instead (see #101) — its season/episode numbers are TVDB's
   // raw numbers, not TMDB's, regardless of whether show_tmdb_id is set.
   tvdb_sourced?: boolean;
+  // The show's actual TVDB/TMDB numbering preference (#186) and, when it's
+  // "tvdb", this item's translated position — see lib/episodeHref.ts, which
+  // every card/link builder should go through rather than re-deriving this.
+  show_episode_order?: "tmdb" | "tvdb" | null;
+  tvdb_season_number?: number | null;
+  tvdb_episode_number?: number | null;
   next_up_hidden?: boolean;
+  // Next Up remaining-content estimate (#170) — released unwatched episodes
+  // for the show and their estimated total runtime in minutes.
+  episodes_left?: number | null;
+  remaining_runtime?: number | null;
   known_for_department?: string | null;
   in_library?: boolean;
   playable?: boolean;
@@ -854,6 +873,7 @@ export interface ProfileWatchedItem {
   watched_at: string;
   show_title: string | null;
   show_tmdb_id: number | null;
+  show_tvdb_id: number | null;
   show_poster_path: string | null;
   season_number: number | null;
   episode_number: number | null;
@@ -1117,7 +1137,7 @@ export const api = {
     getCollection: (collectionId: number, token?: string) =>
       get<CollectionDetail>(`/media/collection/${collectionId}`, undefined, token),
 
-    tmdbList: (params: { type: string; category?: string; page?: number; genre?: string; year?: number; min_rating?: number; status?: string }, token?: string) =>
+    tmdbList: (params: { type: string; category?: string; page?: number; genre?: string[]; year?: number[]; min_rating?: number; status?: string; collection?: string[]; watch?: string[]; arr?: string[]; original_language?: string }, token?: string) =>
       get<{ results: MediaItem[]; page: number; total_pages: number; total_results: number }>("/media/tmdb/list", params, token),
 
     search: (q: string, type?: string, page: number = 1, year?: number, token?: string, inLibrary?: boolean) =>
@@ -1134,6 +1154,9 @@ export const api = {
 
     airingTodayCollected: (token?: string) =>
       get<{ results: MediaItem[] }>("/media/airing-today/collected", {}, token),
+
+    publicPosterWall: () =>
+      get<{ posters: { poster_path: string; title: string | null; media_type: "movie" | "series" }[] }>("/media/public/poster-wall"),
 
     trendingMovies: (page: number = 1, token?: string) =>
       get<{ results: MediaItem[]; page: number; total_pages: number; total_results: number }>("/media/trending/movies", { page }, token),
@@ -1261,7 +1284,7 @@ export const api = {
   lists: {
     getAll: (token: string) =>
       get<{ lists: UserList[] }>("/lists", undefined, token),
-    getPublic: (token: string) =>
+    getPublic: (token?: string) =>
       get<{ lists: PublicList[] }>("/lists/public", undefined, token),
     create: (body: { name: string; description?: string; privacy_level?: PrivacyLevel }, token: string) =>
       post<UserList>("/lists", body, token),
@@ -1306,7 +1329,7 @@ export const api = {
     getPublic: (userId: number, token?: string) =>
       get<PublicProfile>(`/profile/${userId}`, undefined, token),
     publicAccessStatus: () =>
-      get<{ allow_public_profiles: boolean }>("/profile/public-access-status"),
+      get<{ enable_logged_out_navigation: boolean }>("/profile/public-access-status"),
     update: (body: Partial<UserPreferences>, token: string) =>
       patch<UserPreferences>("/profile/me", body, token),
     uploadAvatar: (formData: FormData, token: string) =>
@@ -1321,6 +1344,14 @@ export const api = {
       get<{ results: UserSearchResult[] }>("/profile/search", { q }, token),
     getStats: (userId: number, token?: string) =>
       get<UserStats>(`/profile/${userId}/stats`, undefined, token),
+    topRatedMovies: (userId: number, page: number = 1, token?: string) =>
+      get<{ results: ProfileRatedItem[]; page: number; total_pages: number; total_results: number }>(`/profile/${userId}/top-rated-movies`, { page }, token),
+    topRatedShows: (userId: number, page: number = 1, token?: string) =>
+      get<{ results: ProfileRatedItem[]; page: number; total_pages: number; total_results: number }>(`/profile/${userId}/top-rated-shows`, { page }, token),
+    recentlyWatchedMovies: (userId: number, page: number = 1, token?: string) =>
+      get<{ results: ProfileWatchedItem[]; page: number; total_pages: number; total_results: number }>(`/profile/${userId}/recently-watched-movies`, { page }, token),
+    recentlyWatchedShows: (userId: number, page: number = 1, token?: string) =>
+      get<{ results: ProfileWatchedItem[]; page: number; total_pages: number; total_results: number }>(`/profile/${userId}/recently-watched-shows`, { page }, token),
   },
 
   comments: {

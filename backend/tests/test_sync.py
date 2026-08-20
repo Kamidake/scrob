@@ -485,5 +485,394 @@ class ExpandMultiEpisodeItemsTests(unittest.TestCase):
         self.assertEqual(expanded, [item])
 
 
+from sqlalchemy.sql import Select as _SASelect
+from sqlalchemy.dialects import postgresql as _pg
+
+
+class _ReconcileFakeDB:
+    """Serves only what _reconcile_plex_watchlist itself executes: the
+    baseline re-read (SELECT) and the baseline write (UPDATE). Everything
+    heavier sits behind the patched load/apply helpers."""
+
+    def __init__(self, baseline):
+        self._baseline = baseline
+        self.baseline_writes = []
+        self.commit = AsyncMock()
+        self.rollback = AsyncMock()
+
+    async def execute(self, stmt):
+        if isinstance(stmt, _SASelect):
+            return _Result(self._baseline)
+        params = stmt.compile(dialect=_pg.dialect()).params
+        self.baseline_writes.append(params.get("plex_watchlist_synced_keys"))
+        return SimpleNamespace()
+
+
+def _wl_conn(pull=True, push=True):
+    return MediaServerConnection(
+        id=1, user_id=1, type="plex", token="tok",
+        plex_sync_watchlist=pull, plex_push_watchlist=push,
+    )
+
+
+def _remote_item(kind, tmdb_id, rating_key="rk", title="Title"):
+    return {"type": kind, "Guid": [{"id": f"tmdb://{tmdb_id}"}], "ratingKey": rating_key, "title": title}
+
+
+class PlexWatchlistReconcileTests(unittest.IsolatedAsyncioTestCase):
+    """The routine wiring around core.watchlist_reconcile: what plan reaches
+    the apply helpers, and what baseline gets persisted."""
+
+    async def _run(self, db, conn, remote_items, local_state, applied_local, remote_failures=(set(), set())):
+        apply_local = AsyncMock(return_value=applied_local)
+        apply_remote = AsyncMock(return_value=remote_failures)
+        with patch.object(sync.plex, "get_watchlist", AsyncMock(return_value=remote_items)), \
+             patch.object(sync, "_load_local_watchlist_state", AsyncMock(return_value=local_state)), \
+             patch.object(sync, "_apply_local_watchlist_changes", apply_local), \
+             patch.object(sync, "_apply_remote_watchlist_changes", apply_remote):
+            await sync._reconcile_plex_watchlist(db, 1, conn, "tmdb-key")
+        local_plan = apply_local.call_args.args[4] if apply_local.call_args else None
+        remote_plan = apply_remote.call_args.args[1] if apply_remote.call_args else None
+        return local_plan, remote_plan, apply_local, apply_remote
+
+    async def test_remote_removal_is_applied_locally_not_resurrected(self):
+        """Regression: Plex auto-removed a watched item; the old additive push
+        re-added it. Now the baseline turns it into a local removal."""
+        db = _ReconcileFakeDB(["movie:1"])
+        local_plan, remote_plan, _, _ = await self._run(
+            db, _wl_conn(), [], (SimpleNamespace(id=5), {"movie:1": (11, "Inception")}), applied_local=set(),
+        )
+        self.assertEqual(local_plan.remove_local, {"movie:1"})
+        self.assertEqual(remote_plan.push_add, frozenset())
+        self.assertEqual(db.baseline_writes, [[]])
+        db.commit.assert_awaited()
+
+    async def test_deleted_managed_list_resets_baseline_instead_of_wiping_plex(self):
+        """Regression: with the list deleted in the UI, a stale baseline must
+        not turn the entire real Plex watchlist into push_remove calls."""
+        db = _ReconcileFakeDB(["movie:1", "show:2"])
+        remote = [_remote_item("movie", 1), _remote_item("show", 2)]
+        local_plan, remote_plan, _, _ = await self._run(
+            db, _wl_conn(), remote, (None, {}), applied_local={"movie:1", "show:2"},
+        )
+        self.assertEqual(remote_plan.push_remove, frozenset())
+        self.assertEqual(local_plan.add_local, {"movie:1", "show:2"})  # bootstrap re-import
+        self.assertEqual(db.baseline_writes, [["movie:1", "show:2"]])
+
+    async def test_bootstrap_first_contact_is_purely_additive(self):
+        db = _ReconcileFakeDB(None)
+        local_plan, remote_plan, _, _ = await self._run(
+            db, _wl_conn(), [_remote_item("show", 2)],
+            (SimpleNamespace(id=5), {"movie:1": (11, "Inception")}),
+            applied_local={"movie:1", "show:2"},
+        )
+        self.assertEqual(remote_plan.push_add, {"movie:1"})
+        self.assertEqual(local_plan.add_local, {"show:2"})
+        self.assertEqual(local_plan.remove_local, frozenset())
+        self.assertEqual(db.baseline_writes, [["movie:1", "show:2"]])
+
+    async def test_failed_remote_add_stays_out_of_the_baseline(self):
+        db = _ReconcileFakeDB(["movie:1"])
+        _, remote_plan, _, _ = await self._run(
+            db, _wl_conn(), [_remote_item("movie", 1)],
+            (SimpleNamespace(id=5), {"movie:1": (11, "A"), "movie:9": (12, "B")}),
+            applied_local={"movie:1", "movie:9"},
+            remote_failures=({"movie:9"}, set()),
+        )
+        self.assertEqual(remote_plan.push_add, {"movie:9"})
+        self.assertEqual(db.baseline_writes, [["movie:1"]])  # movie:9 retries next run
+
+    async def test_suppressed_run_changes_nothing(self):
+        baseline = [f"movie:{i}" for i in range(12)]
+        db = _ReconcileFakeDB(baseline)
+        local = {key: (i, "T") for i, key in enumerate(baseline)}
+        _, _, apply_local, apply_remote = await self._run(
+            db, _wl_conn(), [], (SimpleNamespace(id=5), local), applied_local=set(),
+        )
+        apply_local.assert_not_called()
+        apply_remote.assert_not_called()
+        self.assertEqual(db.baseline_writes, [])
+        db.commit.assert_not_awaited()
+
+    async def test_fetch_failure_is_swallowed_and_rolled_back(self):
+        db = _ReconcileFakeDB(["movie:1"])
+        with patch.object(sync.plex, "get_watchlist", AsyncMock(side_effect=RuntimeError("plex down"))):
+            await sync._reconcile_plex_watchlist(db, 1, _wl_conn(), "tmdb-key")
+        db.rollback.assert_awaited()
+        self.assertEqual(db.baseline_writes, [])
+
+    async def test_disabled_flags_do_nothing(self):
+        db = _ReconcileFakeDB(["movie:1"])
+        fetch = AsyncMock()
+        with patch.object(sync.plex, "get_watchlist", fetch):
+            await sync._reconcile_plex_watchlist(db, 1, _wl_conn(pull=False, push=False), "tmdb-key")
+        fetch.assert_not_called()
+
+
+class PushEnabledPropertyTests(unittest.TestCase):
+    """The scheduler's auto-push gate and the manual push endpoint share this
+    property, so a watchlist-only connection can't be forgotten by one of
+    them again."""
+
+    def test_watchlist_only_connection_is_push_enabled(self):
+        conn = MediaServerConnection(
+            push_collection=False, push_watched=False, push_ratings=False, push_playback=False,
+            plex_push_watchlist=True,
+        )
+        self.assertTrue(conn.push_enabled)
+
+    def test_no_push_flags_at_all(self):
+        conn = MediaServerConnection(
+            push_collection=False, push_watched=False, push_ratings=False, push_playback=False,
+            plex_push_watchlist=False,
+        )
+        self.assertFalse(conn.push_enabled)
+
+    def test_classic_push_flags_still_count(self):
+        conn = MediaServerConnection(
+            push_collection=False, push_watched=True, push_ratings=False, push_playback=False,
+            plex_push_watchlist=False,
+        )
+        self.assertTrue(conn.push_enabled)
+
+
+class ConnectionUpdateBaselineResetTests(unittest.IsolatedAsyncioTestCase):
+    """Flipping a watchlist direction off→on must restart from a clean
+    bootstrap - a baseline recorded under the old settings must not drive
+    deletions."""
+
+    async def _patch_connection(self, conn, **body_fields):
+        import schemas
+        from routers import auth as auth_router
+
+        db = _FakeSession(conn)
+        body = schemas.MediaServerConnectionUpdate(**body_fields)
+        return await auth_router.update_connection(
+            connection_id=1, body=body, db=db, current_user=SimpleNamespace(id=1),
+        )
+
+    def _conn(self, sync_on=False, push_on=False):
+        return MediaServerConnection(
+            id=1, user_id=1, type="plex", name="Plex", url="http://p", token="t",
+            plex_sync_watchlist=sync_on, plex_push_watchlist=push_on,
+            plex_watchlist_synced_keys=["movie:1"],
+        )
+
+    async def test_enabling_pull_resets_the_baseline(self):
+        conn = self._conn()
+        await self._patch_connection(conn, plex_sync_watchlist=True)
+        self.assertIsNone(conn.plex_watchlist_synced_keys)
+
+    async def test_enabling_push_resets_the_baseline(self):
+        conn = self._conn()
+        await self._patch_connection(conn, plex_push_watchlist=True)
+        self.assertIsNone(conn.plex_watchlist_synced_keys)
+
+    async def test_updating_while_already_enabled_keeps_the_baseline(self):
+        conn = self._conn(sync_on=True)
+        await self._patch_connection(conn, plex_sync_watchlist=True)
+        self.assertEqual(conn.plex_watchlist_synced_keys, ["movie:1"])
+
+    async def test_disabling_keeps_the_baseline(self):
+        conn = self._conn(sync_on=True)
+        await self._patch_connection(conn, plex_sync_watchlist=False)
+        self.assertEqual(conn.plex_watchlist_synced_keys, ["movie:1"])
+
+
+class ProviderAddedAtTests(unittest.TestCase):
+    """The library add-date each media server reports, normalised to naive UTC
+    like every other timestamp Scrob stores."""
+
+    def test_plex_epoch_seconds(self):
+        got = sync.provider_added_at({"addedAt": 1754179200}, sync.CollectionSource.plex)
+        self.assertEqual(got, datetime(2025, 8, 3, 0, 0, 0))
+
+    def test_plex_accepts_the_value_as_a_string(self):
+        got = sync.provider_added_at({"addedAt": "1754179200"}, sync.CollectionSource.plex)
+        self.assertEqual(got, datetime(2025, 8, 3, 0, 0, 0))
+
+    def test_jellyfin_iso_with_dotnet_fractional_seconds(self):
+        got = sync.provider_added_at(
+            {"DateCreated": "2026-08-01T09:30:00.0000000Z"}, sync.CollectionSource.jellyfin
+        )
+        self.assertEqual(got, datetime(2026, 8, 1, 9, 30, 0))
+        self.assertIsNone(got.tzinfo)
+
+    def test_emby_iso_is_converted_to_utc(self):
+        got = sync.provider_added_at(
+            {"DateCreated": "2026-08-01T11:30:00+02:00"}, sync.CollectionSource.emby
+        )
+        self.assertEqual(got, datetime(2026, 8, 1, 9, 30, 0))
+
+    def test_sources_without_a_library_date_return_none(self):
+        # Nuvio and Stremio items are synthesized with a fixed key set, so they
+        # must never be read as if they were a media browser payload.
+        for source in (sync.CollectionSource.nuvio, sync.CollectionSource.stremio):
+            self.assertIsNone(
+                sync.provider_added_at({"DateCreated": "2026-08-01T09:30:00Z"}, source)
+            )
+
+    def test_missing_or_unusable_values_return_none(self):
+        cases = [
+            ({}, sync.CollectionSource.plex),
+            ({"addedAt": None}, sync.CollectionSource.plex),
+            ({"addedAt": "not-a-number"}, sync.CollectionSource.plex),
+            ({}, sync.CollectionSource.jellyfin),
+            ({"DateCreated": ""}, sync.CollectionSource.jellyfin),
+            ({"DateCreated": "yesterday"}, sync.CollectionSource.jellyfin),
+        ]
+        for item, source in cases:
+            self.assertIsNone(sync.provider_added_at(item, source), (item, source))
+
+
+class CollectionAddedAtHealTests(unittest.TestCase):
+    """The heal has to lower Collection.added_at without ever raising it, which
+    is why the comparison happens in SQL rather than in Python."""
+
+    def test_statement_takes_the_lesser_of_stored_and_provider_dates(self):
+        rendered = str(sync.collection_added_at_heal_stmt().compile(dialect=_pg.dialect()))
+        self.assertIn("UPDATE collections SET added_at=least(collections.added_at,", rendered)
+        self.assertIn("WHERE collections.id =", rendered)
+
+
+class _HealPushEchoRow:
+    def __init__(self, id, media_id, watched_at):
+        self.id = id
+        self.media_id = media_id
+        self.watched_at = watched_at
+
+
+class _HealPushEchoResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _HealPushEchoDB:
+    """First execute() returns the ordered provisional-events query, second
+    returns the (media_id, earliest_id) grouping, any further ones (the
+    DELETE) are just recorded as no-ops."""
+
+    def __init__(self, rows, earliest_by_media):
+        self._results = [
+            _HealPushEchoResult(rows),
+            _HealPushEchoResult(list(earliest_by_media.items())),
+        ]
+        self.executed_statements = []
+        self.commit = AsyncMock()
+
+    async def execute(self, stmt):
+        self.executed_statements.append(stmt)
+        if self._results:
+            return self._results.pop(0)
+        return _HealPushEchoResult([])
+
+
+class HealPushEchoDuplicatesTests(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for the #247/#251 cleanup heal: a burst of provisional
+    watch events created by a Jellyfin/Emby mark-watched push echoing back as
+    a webhook, on top of whatever real watch record already existed (that's
+    the only reason the item was being pushed at all)."""
+
+    async def test_burst_of_duplicates_for_already_watched_items_is_healed(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        # 5 provisional completions 10s apart, media 101..105 - each already
+        # has an earlier (non-burst) watch event, i.e. a lower id than these.
+        rows = [_HealPushEchoRow(id=1000 + i, media_id=101 + i, watched_at=base + timedelta(seconds=10 * i)) for i in range(5)]
+        earliest_by_media = {101 + i: 1 + i for i in range(5)}  # all pre-date the burst ids
+        db = _HealPushEchoDB(rows, earliest_by_media)
+
+        result = await sync.heal_push_echo_duplicates(db=db, current_user=SimpleNamespace(id=1))
+
+        self.assertEqual(result["healed"], 5)
+        db.commit.assert_awaited_once()
+
+    async def test_burst_below_the_size_threshold_is_left_alone(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        rows = [_HealPushEchoRow(id=1000 + i, media_id=101 + i, watched_at=base + timedelta(seconds=10 * i)) for i in range(3)]
+        earliest_by_media = {101 + i: 1 + i for i in range(3)}
+        db = _HealPushEchoDB(rows, earliest_by_media)
+
+        result = await sync.heal_push_echo_duplicates(db=db, current_user=SimpleNamespace(id=1))
+
+        self.assertEqual(result["healed"], 0)
+
+    async def test_a_titles_only_ever_recorded_watch_is_never_deleted_even_in_a_large_burst(self):
+        # Simulates marking a whole season watched from Jellyfin's own UI -
+        # also produces a burst of provisional TogglePlayed webhooks, but each
+        # one is a genuinely first-time watch and must survive the heal.
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        rows = [_HealPushEchoRow(id=1000 + i, media_id=101 + i, watched_at=base + timedelta(seconds=10 * i)) for i in range(6)]
+        earliest_by_media = {101 + i: 1000 + i for i in range(6)}  # each IS its own earliest record
+        db = _HealPushEchoDB(rows, earliest_by_media)
+
+        result = await sync.heal_push_echo_duplicates(db=db, current_user=SimpleNamespace(id=1))
+
+        self.assertEqual(result["healed"], 0)
+
+    async def test_a_mixed_burst_only_removes_the_actual_duplicates(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        rows = [_HealPushEchoRow(id=1000 + i, media_id=101 + i, watched_at=base + timedelta(seconds=10 * i)) for i in range(5)]
+        earliest_by_media = {101: 1000, 102: 5, 103: 1002, 104: 8, 105: 1004}  # 101, 103, 105 are their own earliest
+        db = _HealPushEchoDB(rows, earliest_by_media)
+
+        result = await sync.heal_push_echo_duplicates(db=db, current_user=SimpleNamespace(id=1))
+
+        self.assertEqual(result["healed"], 2)  # only media 102 and 104
+
+    async def test_events_far_apart_never_cluster_into_a_burst(self):
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        # 6 events, each an hour apart - well past BURST_GAP, so no cluster
+        # ever reaches BURST_MIN_SIZE even though the total count would.
+        rows = [_HealPushEchoRow(id=1000 + i, media_id=101 + i, watched_at=base + timedelta(hours=i)) for i in range(6)]
+        earliest_by_media = {101 + i: 1 + i for i in range(6)}
+        db = _HealPushEchoDB(rows, earliest_by_media)
+
+        result = await sync.heal_push_echo_duplicates(db=db, current_user=SimpleNamespace(id=1))
+
+        self.assertEqual(result["healed"], 0)
+
+    async def test_no_provisional_events_short_circuits_without_further_queries(self):
+        db = _HealPushEchoDB([], {})
+        result = await sync.heal_push_echo_duplicates(db=db, current_user=SimpleNamespace(id=1))
+        self.assertEqual(result, {"status": "ok", "healed": 0})
+        self.assertEqual(len(db.executed_statements), 1)
+
+
+class _HealStuckUnwatchedDB:
+    def __init__(self, ids):
+        self._results = [_HealPushEchoResult([(i,) for i in ids])]
+        self.executed_statements = []
+        self.commit = AsyncMock()
+
+    async def execute(self, stmt):
+        self.executed_statements.append(stmt)
+        if self._results:
+            return self._results.pop(0)
+        return _HealPushEchoResult([])
+
+
+class HealStuckUnwatchedTests(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for the #253 cleanup heal: a WatchEvent stuck as
+    completed=False (Jellyfin/Emby reporting PlayCount > 0 with Played still
+    False) used to block every later sync from ever recording the real
+    completion once it happened."""
+
+    async def test_matching_rows_are_healed(self):
+        db = _HealStuckUnwatchedDB([10, 11, 12])
+        result = await sync.heal_stuck_unwatched(db=db, current_user=SimpleNamespace(id=1))
+        self.assertEqual(result, {"status": "ok", "healed": 3})
+        db.commit.assert_awaited_once()
+
+    async def test_no_matches_short_circuits_without_delete_or_commit(self):
+        db = _HealStuckUnwatchedDB([])
+        result = await sync.heal_stuck_unwatched(db=db, current_user=SimpleNamespace(id=1))
+        self.assertEqual(result, {"status": "ok", "healed": 0})
+        self.assertEqual(len(db.executed_statements), 1)
+        db.commit.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -56,6 +56,7 @@ class UserSettings(Base):
     radarr_root_folder     : Mapped[Optional[str]] = mapped_column(String(500))
     radarr_quality_profile : Mapped[Optional[int]] = mapped_column(Integer)
     radarr_tags            : Mapped[Optional[list[int]]] = mapped_column(JSONB)
+    radarr_customize_on_add : Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
 
     # Sonarr integration
     sonarr_url              : Mapped[Optional[str]] = mapped_column(String(500))
@@ -64,6 +65,7 @@ class UserSettings(Base):
     sonarr_quality_profile  : Mapped[Optional[int]] = mapped_column(Integer)
     sonarr_tags             : Mapped[Optional[list[int]]] = mapped_column(JSONB)
     sonarr_season_folder    : Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    sonarr_customize_on_add : Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
 
     # Trakt OAuth app credentials (per-user)
     trakt_client_id          : Mapped[Optional[str]]      = mapped_column(String(255))
@@ -142,6 +144,13 @@ class UserSettings(Base):
     # MDBList auto sync/push interval, in hours (null = disabled)
     mdblist_auto_sync_interval: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     mdblist_auto_push_interval: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Bingebase integration
+    bingebase_webhook_url: Mapped[Optional[str]] = mapped_column(String(500))
+    bingebase_api_key: Mapped[Optional[str]] = mapped_column(String(255))
+    bingebase_scrobble: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    bingebase_push_watched: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    bingebase_push_ratings: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
     user : Mapped["User"] = relationship(back_populates="settings")
 

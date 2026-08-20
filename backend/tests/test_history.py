@@ -7,9 +7,13 @@ from unittest.mock import AsyncMock, patch
 os.environ.setdefault("SECRET_KEY", "test-secret")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
 
-from models.base import MediaType
+from models.base import MediaType, CollectionSource
+from models.episode_order import EpisodeOrderMapping, UserShowEpisodeOrder
 from models.events import WatchEvent
 from models.media import Media
+from models.playback_progress import PlaybackProgress
+from models.playback_session import PlaybackSession
+from models.rewatch import ShowRewatch
 from models.show import Show
 from routers import history
 from schemas import WatchEventCreate
@@ -46,6 +50,14 @@ class _Result:
         return [] if self.item is None else [self.item]
 
 
+class _NestedTxn:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False  # let exceptions propagate, like a real SAVEPOINT rollback
+
+
 class _FakeSession:
     def __init__(self, results):
         self.added = []
@@ -59,11 +71,14 @@ class _FakeSession:
             value.id = 101
         self.added.append(value)
 
+    def begin_nested(self):
+        return _NestedTxn()
+
 
 class ManualEpisodeWatchTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.user = SimpleNamespace(id=7)
-        self.show = SimpleNamespace(id=55)
+        self.show = SimpleNamespace(id=55, tvdb_id=None)
         self.event = WatchEventCreate(
             tmdb_id=5767197,
             media_type=MediaType.episode,
@@ -83,6 +98,12 @@ class ManualEpisodeWatchTests(unittest.IsolatedAsyncioTestCase):
             patch("routers.webhooks._find_or_create_show", find_show),
             patch("routers.history.tmdb.get_episode", get_episode),
             patch("routers.history.enrich_media", enrich),
+            # Some call sites (e.g. the orphan-repair branch) go through
+            # enrich_media_safely, which resolves enrich_media via
+            # core.enrichment's own namespace rather than history.py's
+            # imported alias - patch it there too so every code path is
+            # controlled by this same mock.
+            patch("core.enrichment.enrich_media", enrich),
             patch("routers.history._push_watch_state", push_state),
         )
         return patches, get_key, find_show, get_episode, enrich, push_state
@@ -93,7 +114,7 @@ class ManualEpisodeWatchTests(unittest.IsolatedAsyncioTestCase):
         db = _FakeSession([None, None, None, None])
         patches, get_key, find_show, get_episode, enrich, push_state = self._patch_dependencies()
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
             response = await history.mark_as_watched(self.event, db, self.user)
 
         media = next(value for value in db.added if isinstance(value, Media))
@@ -127,13 +148,16 @@ class ManualEpisodeWatchTests(unittest.IsolatedAsyncioTestCase):
         db = _FakeSession([None, orphan, None, None])  # trailing None: record_rewatch_progress's Media lookup
         patches, _, _, get_episode, enrich, _ = self._patch_dependencies()
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
             await history.mark_as_watched(self.event, db, self.user)
 
         self.assertEqual(orphan.show_id, self.show.id)
         self.assertEqual((orphan.season_number, orphan.episode_number), (1, 1))
         get_episode.assert_not_awaited()
-        enrich.assert_awaited_once_with(orphan, api_key="tmdb-key", series_tmdb_id=277439)
+        enrich.assert_awaited_once_with(
+            orphan, api_key="tmdb-key", series_tmdb_id=277439,
+            tvdb_id=None, tvdb_api_key=None, tvdb_lang=None,
+        )
 
     async def test_tvdb_mapping_uses_canonical_show_position(self):
         mapped_media = Media(
@@ -155,7 +179,7 @@ class ManualEpisodeWatchTests(unittest.IsolatedAsyncioTestCase):
         db = _FakeSession([mapped_media, None, None])  # trailing None: record_rewatch_progress's Media lookup
         patches, _, _, get_episode, enrich, push_state = self._patch_dependencies()
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
             response = await history.mark_as_watched(event, db, self.user)
 
         self.assertEqual(response["status"], "ok")
@@ -295,6 +319,149 @@ class MarkShowWatchedDateTests(unittest.IsolatedAsyncioTestCase):
         response, event = await self._mark_show(watched_at=custom)
         self.assertEqual(response["count"], 1)
         self.assertEqual(event.watched_at, custom)
+
+
+class PushWatchStateExcludeConnectionTests(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for #190: a two-way-sync connection (webhook in +
+    push_watched out) can self-trigger an unbounded loop - Scrob pushes
+    "unwatched" to Jellyfin, Jellyfin's own UserData change re-fires its
+    webhook back into Scrob, which pushes "unwatched" again, forever. The
+    fix is exclude_connection_id: the connection whose webhook triggered
+    this push must be skipped, while other connections still get it."""
+
+    def _connections(self):
+        conn_origin = SimpleNamespace(
+            id=1, type="jellyfin", url="http://origin.local", token="tok1", server_user_id="u1",
+        )
+        conn_other = SimpleNamespace(
+            id=2, type="jellyfin", url="http://other.local", token="tok2", server_user_id="u2",
+        )
+        return conn_origin, conn_other
+
+    def _coll_files(self):
+        cf1 = SimpleNamespace(source=CollectionSource.jellyfin, source_id="item-1")
+        cf2 = SimpleNamespace(source=CollectionSource.jellyfin, source_id="item-2")
+        return cf1, cf2
+
+    async def test_excludes_only_the_originating_connection(self) -> None:
+        conn_origin, conn_other = self._connections()
+        cf1, cf2 = self._coll_files()
+        # Query order in _push_watch_state (settings=None short-circuits every
+        # later trakt/mdblist/simkl query, keeping this fixture minimal):
+        # 1. connections, 2. settings, 3. collection files.
+        db = _FakeSession([[conn_origin, conn_other], None, [cf1, cf2]])
+
+        calls: list[str] = []
+
+        async def fake_mark_unwatched(url, token, user_id, source_id):
+            calls.append(url)
+            return True
+
+        with patch("routers.history.jellyfin_client.mark_unwatched", fake_mark_unwatched):
+            await history._push_watch_state(
+                db, user_id=7, media_ids=[10], watched=False,
+                exclude_connection_id=conn_origin.id,
+            )
+
+        self.assertNotIn("http://origin.local", calls)
+        self.assertIn("http://other.local", calls)
+
+    async def test_no_exclusion_pushes_to_every_connection(self) -> None:
+        # Baseline: without exclude_connection_id (e.g. a manual UI mark, not
+        # webhook-triggered), behavior is unchanged - every push_watched
+        # connection still gets it, including what would be conn_origin above.
+        conn_origin, conn_other = self._connections()
+        cf1, cf2 = self._coll_files()
+        db = _FakeSession([[conn_origin, conn_other], None, [cf1, cf2]])
+
+        calls: list[str] = []
+
+        async def fake_mark_unwatched(url, token, user_id, source_id):
+            calls.append(url)
+            return True
+
+        with patch("routers.history.jellyfin_client.mark_unwatched", fake_mark_unwatched):
+            await history._push_watch_state(db, user_id=7, media_ids=[10], watched=False)
+
+        self.assertIn("http://origin.local", calls)
+        self.assertIn("http://other.local", calls)
+
+
+class GetNowPlayingEpisodeOrderTests(unittest.IsolatedAsyncioTestCase):
+    """Regression test for #186: get_now_playing builds its media dict
+    inline rather than going through enrich_with_state, so it needs its own
+    wiring for the episode-order preference / TVDB position translation used
+    by the Now Playing bar's link building."""
+
+    async def test_tvdb_preference_session_gets_translated_position(self) -> None:
+        media = Media(
+            id=10, tmdb_id=550, media_type=MediaType.episode,
+            title="Ep", season_number=4, episode_number=12, show_id=1,
+        )
+        show = Show(id=1, tmdb_id=550, tvdb_id=999, title="Show")
+        session = PlaybackSession(
+            id=1, user_id=7, media_id=10, session_key="k", source="plex",
+            state="playing", progress_percent=0.1, progress_seconds=60,
+            started_at=datetime(2026, 1, 1), updated_at=datetime(2026, 1, 1),
+        )
+        preference = UserShowEpisodeOrder(user_id=7, series_tmdb_id=550, episode_order="tvdb")
+        mapping = EpisodeOrderMapping(
+            series_tmdb_id=550, tmdb_season_number=4, tmdb_episode_number=12,
+            tmdb_episode_id=1, tvdb_id=1, tvdb_season_number=3, tvdb_episode_number=8,
+            match_method="external_id",
+        )
+        db = _FakeSession([
+            [(session, media)],  # main PlaybackSession+Media query
+            show,                # per-session Show lookup
+            [preference],        # get_episode_orders_for_series
+            [mapping],           # get_tmdb_to_tvdb_positions
+        ])
+
+        result = await history.get_now_playing(db=db, current_user=SimpleNamespace(id=7))
+
+        item = result["now_playing"][0]["media"]
+        self.assertEqual(item["show_episode_order"], "tvdb")
+        self.assertEqual(item["tvdb_season_number"], 3)
+        self.assertEqual(item["tvdb_episode_number"], 8)
+
+    async def test_tmdb_preference_session_is_untouched(self) -> None:
+        media = Media(
+            id=10, tmdb_id=550, media_type=MediaType.episode,
+            title="Ep", season_number=4, episode_number=12, show_id=1,
+        )
+        show = Show(id=1, tmdb_id=550, tvdb_id=999, title="Show")
+        session = PlaybackSession(
+            id=1, user_id=7, media_id=10, session_key="k", source="plex",
+            state="playing", progress_percent=0.1, progress_seconds=60,
+            started_at=datetime(2026, 1, 1), updated_at=datetime(2026, 1, 1),
+        )
+        db = _FakeSession([
+            [(session, media)],  # main PlaybackSession+Media query
+            show,                # per-session Show lookup
+            [],                  # get_episode_orders_for_series - no preference row
+        ])
+
+        result = await history.get_now_playing(db=db, current_user=SimpleNamespace(id=7))
+
+        item = result["now_playing"][0]["media"]
+        self.assertNotIn("show_episode_order", item)
+        self.assertNotIn("tvdb_season_number", item)
+
+
+class ClearHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clears_playback_progress_along_with_watch_events(self) -> None:
+        # Continue Watching is sourced from PlaybackProgress, not WatchEvent -
+        # a full clear must reset it too, or finished/cleared items keep
+        # showing up there as if still in progress.
+        db = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock())
+
+        await history.clear_history(db=db, current_user=SimpleNamespace(id=7))
+
+        tables_deleted = {
+            call.args[0].table.name for call in db.execute.call_args_list
+        }
+        self.assertEqual(tables_deleted, {ShowRewatch.__tablename__, WatchEvent.__tablename__, PlaybackProgress.__tablename__})
+        db.commit.assert_awaited_once()
 
 
 if __name__ == "__main__":

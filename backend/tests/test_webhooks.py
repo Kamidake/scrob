@@ -9,13 +9,20 @@ os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/
 
 from sqlalchemy.orm.exc import StaleDataError
 
+from models.base import MediaType
 from routers import webhooks
 from routers.webhooks import (
+    _backfill_plex_runtime,
     _commit_playback_session_update,
+    _consume_recently_pushed_watched,
     _episode_for_progress,
     _is_duplicate_webhook_delivery,
+    _maybe_bingebase_scrobble,
+    _resolve_tvdb_episode_to_tmdb_position,
     _write_watch_event,
+    find_or_create_media_jellyfin,
     find_or_create_media_jellyfin_multi,
+    mark_pushed_watched,
     parse_jellyfin_payload,
 )
 
@@ -64,6 +71,9 @@ class DuplicateWebhookDeliveryTests(unittest.TestCase):
 
 
 class WriteWatchEventDedupTests(IsolatedAsyncioTestCase):
+    def setUp(self):
+        webhooks._recently_pushed_watched.clear()
+
     async def test_first_completed_event_is_recorded(self):
         db = _FakeDB(queued_scalars=[None])  # no recent WatchEvent found
         await _write_watch_event(db, user_id=1, media_id=2, progress_percent=1.0, progress_seconds=120, completed=True)
@@ -75,6 +85,198 @@ class WriteWatchEventDedupTests(IsolatedAsyncioTestCase):
         db = _FakeDB(queued_scalars=[123])  # a recent WatchEvent id is found
         await _write_watch_event(db, user_id=1, media_id=2, progress_percent=1.0, progress_seconds=120, completed=True)
         self.assertEqual(len(db.added), 0)
+
+    async def test_echo_of_a_just_pushed_mark_watched_is_skipped(self):
+        # Regression for #247/#251: pushing "mark watched" to Jellyfin/Emby can
+        # echo straight back as a UserDataSaved webhook. The item's real watch
+        # event is typically old (imported history), so the 5-minute dedup
+        # above never catches it and it used to land as a brand new WatchEvent
+        # stamped at push time - even though no recent duplicate is queued here.
+        mark_pushed_watched(user_id=1, media_id=2)
+        db = _FakeDB(queued_scalars=[None])
+        await _write_watch_event(db, user_id=1, media_id=2, progress_percent=1.0, progress_seconds=120, completed=True)
+        self.assertEqual(len(db.added), 0)
+
+    async def test_echo_suppression_is_scoped_to_the_pushed_user_and_media(self):
+        mark_pushed_watched(user_id=1, media_id=2)
+        db = _FakeDB(queued_scalars=[None, None])
+        await _write_watch_event(db, user_id=1, media_id=999, progress_percent=1.0, progress_seconds=120, completed=True)
+        await _write_watch_event(db, user_id=999, media_id=2, progress_percent=1.0, progress_seconds=120, completed=True)
+        self.assertEqual(len(db.added), 2)
+
+    async def test_echo_suppression_is_one_shot(self):
+        # A real rewatch shortly after must not be silently swallowed too -
+        # only the one echo actually expected back from the push is consumed.
+        mark_pushed_watched(user_id=1, media_id=2)
+        db = _FakeDB(queued_scalars=[None, None])
+        await _write_watch_event(db, user_id=1, media_id=2, progress_percent=1.0, progress_seconds=120, completed=True)
+        await _write_watch_event(db, user_id=1, media_id=2, progress_percent=1.0, progress_seconds=120, completed=True)
+        self.assertEqual(len(db.added), 1)
+
+
+class ConsumeRecentlyPushedWatchedTests(unittest.TestCase):
+    def setUp(self):
+        webhooks._recently_pushed_watched.clear()
+
+    def test_unmarked_media_is_not_consumed(self):
+        self.assertFalse(_consume_recently_pushed_watched(user_id=1, media_id=2))
+
+    def test_marked_media_is_consumed_once(self):
+        mark_pushed_watched(user_id=1, media_id=2)
+        self.assertTrue(_consume_recently_pushed_watched(user_id=1, media_id=2))
+        self.assertFalse(_consume_recently_pushed_watched(user_id=1, media_id=2))
+
+    def test_expired_marker_is_not_consumed(self):
+        import datetime
+        mark_pushed_watched(user_id=1, media_id=2)
+        webhooks._recently_pushed_watched[(1, 2)][0] = datetime.datetime.utcnow() - webhooks._PUSHED_WATCHED_TTL - datetime.timedelta(seconds=1)
+        self.assertFalse(_consume_recently_pushed_watched(user_id=1, media_id=2))
+
+    def test_two_pending_pushes_each_consume_their_own_echo(self):
+        # A user pushing the same item to two Jellyfin/Emby connections at
+        # once expects two echoes back - the second shouldn't be treated as
+        # an unexpected duplicate just because the first already consumed.
+        mark_pushed_watched(user_id=1, media_id=2)
+        mark_pushed_watched(user_id=1, media_id=2)
+        self.assertTrue(_consume_recently_pushed_watched(user_id=1, media_id=2))
+        self.assertTrue(_consume_recently_pushed_watched(user_id=1, media_id=2))
+        self.assertFalse(_consume_recently_pushed_watched(user_id=1, media_id=2))
+
+
+class ParseJellyfinPayloadEmbyEventFieldTests(unittest.TestCase):
+    """Regression test for #160: Emby doesn't send NotificationType at all -
+    its webhooks report the event under "Event" (dotted, lowercase names like
+    "playback.stop"), which used to be read from the wrong key entirely,
+    silently no-oping every inbound Emby webhook."""
+
+    def test_reads_notification_type_from_emby_event_field(self):
+        payload = {
+            "Event": "playback.stop",
+            "Item": {
+                "Id": "test1",
+                "Name": "Supergirl",
+                "Type": "Movie",
+                "ProductionYear": 2026,
+                "RunTimeTicks": 64800000000,
+                "ProviderIds": {"Tmdb": "1081003"},
+            },
+            "Session": {
+                "Id": "testsession1",
+                "UserName": "arne",
+                "PlayState": {"PositionTicks": 61560000000, "IsPaused": False},
+            },
+        }
+        data = parse_jellyfin_payload(payload)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["notification_type"], "playback.stop")
+        self.assertEqual(data["title"], "Supergirl")
+
+    def test_notification_type_still_prefers_pascal_case_field(self):
+        payload = {
+            "NotificationType": "PlaybackStop",
+            "Event": "playback.stop",
+            "Item": {"Id": "test1", "Name": "Supergirl", "Type": "Movie"},
+        }
+        data = parse_jellyfin_payload(payload)
+        self.assertEqual(data["notification_type"], "PlaybackStop")
+
+
+class ParseJellyfinPayloadNestedEpisodeSeriesNameTests(unittest.TestCase):
+    """Regression test for #192: Emby's native webhook notifications use this
+    nested Item/Session shape and don't reliably populate SeriesProviderIds
+    for an episode the way Jellyfin's "send all properties" plugin does.
+    Without a series_name fallback here (mirroring the flat-format branch,
+    which already has one), find_or_create_media_jellyfin can never resolve
+    show linkage - Now Playing then shows the bare episode title with no
+    poster instead of the series."""
+
+    def test_nested_episode_payload_includes_series_name_fallback(self):
+        payload = {
+            "Event": "playback.start",
+            "Item": {
+                "Id": "ep1",
+                "Name": "Aquamom",
+                "Type": "Episode",
+                "SeriesName": "Entourage",
+                "ParentIndexNumber": 3,
+                "IndexNumber": 1,
+                "ProviderIds": {"Tmdb": "1081099"},
+                # SeriesProviderIds deliberately absent - this is the exact gap.
+            },
+            "Session": {"Id": "sess1", "UserName": "arne", "PlayState": {}},
+        }
+        data = parse_jellyfin_payload(payload)
+        self.assertIsNotNone(data)
+        self.assertIsNone(data["series_tmdb_id"])
+        self.assertEqual(data["series_name"], "Entourage")
+
+    def test_nested_movie_payload_has_no_series_name(self):
+        # A movie item has no SeriesName field at all - must not crash or
+        # fabricate a value.
+        payload = {
+            "Event": "playback.start",
+            "Item": {"Id": "m1", "Name": "Inception", "Type": "Movie"},
+            "Session": {"Id": "sess1", "PlayState": {}},
+        }
+        data = parse_jellyfin_payload(payload)
+        self.assertIsNone(data["series_name"])
+
+
+class ParseJellyfinPayloadPlayedToCompletionTests(unittest.TestCase):
+    """Regression tests for #206: on auto-play, Emby resets Session.PlayState
+    to the next episode before firing the "playback.stop" event for the one
+    that just finished, so PositionTicks/RunTimeTicks there read 0 - a
+    genuinely completed episode looked like a <5% no-op stop and was silently
+    dropped. PlaybackInfo carries this event's own authoritative position and
+    PlayedToCompletion flag; the flat plugin format exposes the same flag as
+    its own top-level property."""
+
+    def test_nested_format_falls_back_to_playback_info_position(self):
+        payload = {
+            "Event": "playback.stop",
+            "Item": {"Id": "ep1", "Name": "Finale", "Type": "Episode", "RunTimeTicks": 10_000_000},
+            # Session.PlayState already reset for the auto-playing next episode.
+            "Session": {"Id": "sess1", "PlayState": {"PositionTicks": 0}},
+            "PlaybackInfo": {"PositionTicks": 10_000_000, "PlayedToCompletion": True},
+        }
+        data = parse_jellyfin_payload(payload)
+        self.assertEqual(data["progress_percent"], 1.0)
+        self.assertTrue(data["played_to_completion"])
+
+    def test_nested_format_prefers_session_position_when_present(self):
+        # A normal (non-auto-play) stop still has a real Session position -
+        # PlaybackInfo must not override a legitimate in-progress stop.
+        payload = {
+            "Event": "playback.stop",
+            "Item": {"Id": "ep1", "Name": "Ep", "Type": "Episode", "RunTimeTicks": 10_000_000},
+            "Session": {"Id": "sess1", "PlayState": {"PositionTicks": 3_000_000}},
+            "PlaybackInfo": {"PositionTicks": 10_000_000, "PlayedToCompletion": True},
+        }
+        data = parse_jellyfin_payload(payload)
+        self.assertEqual(data["progress_percent"], 0.3)
+
+    def test_nested_format_defaults_played_to_completion_false(self):
+        payload = {
+            "Event": "playback.stop",
+            "Item": {"Id": "ep1", "Name": "Ep", "Type": "Episode"},
+            "Session": {"Id": "sess1", "PlayState": {}},
+        }
+        data = parse_jellyfin_payload(payload)
+        self.assertFalse(data["played_to_completion"])
+
+    def test_flat_format_reads_played_to_completion(self):
+        payload = {
+            "NotificationType": "PlaybackStop",
+            "ItemType": "Episode",
+            "PlayedToCompletion": True,
+        }
+        data = parse_jellyfin_payload(payload)
+        self.assertTrue(data["played_to_completion"])
+
+    def test_flat_format_defaults_played_to_completion_false(self):
+        payload = {"NotificationType": "PlaybackStop", "ItemType": "Episode"}
+        data = parse_jellyfin_payload(payload)
+        self.assertFalse(data["played_to_completion"])
 
 
 class ParseJellyfinFlatPayloadSeasonZeroTests(unittest.TestCase):
@@ -247,7 +449,7 @@ class FindOrCreateMediaJellyfinMultiTests(IsolatedAsyncioTestCase):
     async def test_combined_span_resolves_one_call_per_episode(self):
         seen_episode_numbers = []
 
-        async def fake_resolver(data, db, api_key=None):
+        async def fake_resolver(data, db, api_key=None, user_id=None):
             seen_episode_numbers.append(data["episode_number"])
             return object()
 
@@ -280,7 +482,7 @@ class FindOrCreateMediaJellyfinMultiTests(IsolatedAsyncioTestCase):
     async def test_unresolvable_sub_episode_is_skipped_not_fatal(self):
         # One episode in the span can't be identified (e.g. TMDB lookup
         # failed for just that one) — the rest of the span must still land.
-        async def fake_resolver(data, db, api_key=None):
+        async def fake_resolver(data, db, api_key=None, user_id=None):
             return None if data["episode_number"] == 2 else object()
 
         mock_resolver = AsyncMock(side_effect=fake_resolver)
@@ -289,6 +491,229 @@ class FindOrCreateMediaJellyfinMultiTests(IsolatedAsyncioTestCase):
             result = await find_or_create_media_jellyfin_multi(data, db=None)
 
         self.assertEqual(len(result), 2)
+
+
+class _FastPathScalars:
+    def __init__(self, item):
+        self._item = item
+
+    def first(self):
+        return self._item
+
+
+class _FastPathResult:
+    def __init__(self, item):
+        self._item = item
+
+    def scalars(self):
+        return _FastPathScalars(self._item)
+
+
+class _FastPathDB:
+    """Fakes just enough of AsyncSession for find_or_create_media_jellyfin's
+    CollectionFile fast-path query: a single execute() returning the queued
+    Media match (or None)."""
+
+    def __init__(self, media):
+        self._media = media
+
+    async def execute(self, stmt):
+        return _FastPathResult(self._media)
+
+
+class FindOrCreateMediaJellyfinBackfillShowLinkageTests(IsolatedAsyncioTestCase):
+    """Regression tests for #192 follow-up: the CollectionFile fast-path match
+    in find_or_create_media_jellyfin returned an existing episode Media row
+    as-is even when it was missing show_id (e.g. synced/created before the
+    series_name/CollectionSource.emby fixes existed, or because show
+    resolution simply failed the first time). Since this fast path is hit on
+    every subsequent webhook for an already-synced item, an unlinked episode
+    stayed unlinked forever - Now Playing kept showing the bare episode title
+    instead of the series - unless something backfills show_id here too, the
+    same way the slower TMDB-ID match path a few lines down already did."""
+
+    def _episode_data(self, **overrides):
+        data = {
+            "media_type": "episode",
+            "jellyfin_id": "file-1",
+            "title": "Ep 1",
+            "series_name": "Entourage",
+            "season_number": 1,
+            "episode_number": 1,
+            "tmdb_id": None,
+            "series_tmdb_id": None,
+        }
+        data.update(overrides)
+        return data
+
+    async def test_fast_path_backfills_missing_show_id(self):
+        episode = SimpleNamespace(id=99, media_type=MediaType.episode, show_id=None)
+        show = SimpleNamespace(id=42, tvdb_id=None)
+        db = _FastPathDB(episode)
+
+        with patch("routers.webhooks._resolve_show_for_episode", AsyncMock(return_value=(show, 555))), \
+             patch("routers.webhooks._resolve_tvdb_fallback", AsyncMock(return_value=(None, None, None))), \
+             patch("routers.webhooks.enrich_media", AsyncMock()) as enrich_mock:
+            result = await find_or_create_media_jellyfin(self._episode_data(), db, api_key="key")
+
+        self.assertIs(result, episode)
+        self.assertEqual(episode.show_id, 42)
+        enrich_mock.assert_awaited_once()
+
+    async def test_fast_path_leaves_already_linked_episode_untouched(self):
+        episode = SimpleNamespace(id=100, media_type=MediaType.episode, show_id=7)
+        db = _FastPathDB(episode)
+
+        with patch("routers.webhooks._resolve_show_for_episode", AsyncMock()) as resolve_mock, \
+             patch("routers.webhooks.enrich_media", AsyncMock()) as enrich_mock:
+            result = await find_or_create_media_jellyfin(self._episode_data(), db, api_key="key")
+
+        self.assertIs(result, episode)
+        resolve_mock.assert_not_awaited()
+        enrich_mock.assert_not_awaited()
+
+    async def test_fast_path_show_resolution_failure_still_returns_media(self):
+        # Show couldn't be resolved this time either (e.g. TMDB down) - must
+        # still return the existing media match rather than losing it.
+        episode = SimpleNamespace(id=101, media_type=MediaType.episode, show_id=None)
+        db = _FastPathDB(episode)
+
+        with patch("routers.webhooks._resolve_show_for_episode", AsyncMock(return_value=(None, None))), \
+             patch("routers.webhooks.enrich_media", AsyncMock()) as enrich_mock:
+            result = await find_or_create_media_jellyfin(self._episode_data(), db, api_key="key")
+
+        self.assertIs(result, episode)
+        self.assertIsNone(episode.show_id)
+        enrich_mock.assert_not_awaited()
+
+
+class _QueuedResultDB:
+    """Fakes AsyncSession.execute() as a queue of .scalars().first()-style
+    results, popped in call order."""
+
+    def __init__(self, media_results):
+        self._queue = list(media_results)
+
+    async def execute(self, stmt):
+        return _FastPathResult(self._queue.pop(0) if self._queue else None)
+
+
+class ResolveTvdbEpisodeToTmdbPositionTests(IsolatedAsyncioTestCase):
+    """#162: resolves a Jellyfin-reported TVDB-native (season, episode)
+    position to the canonical TMDB one, computing/caching the mapping for
+    just that season on demand when it isn't known yet."""
+
+    def _show(self):
+        return SimpleNamespace(id=9, tmdb_id=100, tvdb_id=389597)
+
+    async def test_returns_none_without_tvdb_id_or_keys(self):
+        db = AsyncMock()
+        show_no_tvdb = SimpleNamespace(id=9, tmdb_id=100, tvdb_id=None)
+        result = await _resolve_tvdb_episode_to_tmdb_position(db, show_no_tvdb, 2, 1, "tmdb-key", "tvdb-key")
+        self.assertIsNone(result)
+        db.execute.assert_not_awaited()
+
+        result = await _resolve_tvdb_episode_to_tmdb_position(db, self._show(), 2, 1, "tmdb-key", None)
+        self.assertIsNone(result)
+
+    async def test_uses_an_existing_mapping_without_recomputing(self):
+        db = AsyncMock()
+        mapping = SimpleNamespace(tmdb_season_number=1, tmdb_episode_number=25)
+        with (
+            patch("routers.webhooks.get_mapping_by_tvdb_position", AsyncMock(return_value=mapping)),
+            patch("routers.webhooks.ensure_episode_order_mapping_for_season", AsyncMock()) as compute_mock,
+        ):
+            result = await _resolve_tvdb_episode_to_tmdb_position(db, self._show(), 2, 1, "tmdb-key", "tvdb-key")
+        self.assertEqual(result, (1, 25))
+        compute_mock.assert_not_awaited()
+
+    async def test_computes_on_demand_and_reconciles_when_no_mapping_exists_yet(self):
+        db = AsyncMock()
+        new_mapping = SimpleNamespace(
+            tmdb_season_number=1, tmdb_episode_number=25, tvdb_season_number=2, tvdb_episode_number=1,
+        )
+        show = self._show()
+        with (
+            patch("routers.webhooks.get_mapping_by_tvdb_position", AsyncMock(return_value=None)),
+            patch("routers.webhooks.ensure_episode_order_mapping_for_season", AsyncMock(return_value=[new_mapping])),
+            patch("routers.webhooks.reconcile_divergent_episode_media", AsyncMock()) as reconcile_mock,
+        ):
+            result = await _resolve_tvdb_episode_to_tmdb_position(db, show, 2, 1, "tmdb-key", "tvdb-key")
+        self.assertEqual(result, (1, 25))
+        reconcile_mock.assert_awaited_once_with(db, show, season_number=2)
+
+    async def test_returns_none_when_genuinely_unmapped(self):
+        # Real TVDB-only content (#101) - must fall through cleanly, not force a match.
+        db = AsyncMock()
+        with (
+            patch("routers.webhooks.get_mapping_by_tvdb_position", AsyncMock(return_value=None)),
+            patch("routers.webhooks.ensure_episode_order_mapping_for_season", AsyncMock(return_value=[])),
+        ):
+            result = await _resolve_tvdb_episode_to_tmdb_position(db, self._show(), 2, 1, "tmdb-key", "tvdb-key")
+        self.assertIsNone(result)
+
+    async def test_swallows_exceptions_and_returns_none(self):
+        db = AsyncMock()
+        with patch("routers.webhooks.get_mapping_by_tvdb_position", AsyncMock(side_effect=RuntimeError("boom"))):
+            result = await _resolve_tvdb_episode_to_tmdb_position(db, self._show(), 2, 1, "tmdb-key", "tvdb-key")
+        self.assertIsNone(result)
+
+
+class FindOrCreateMediaJellyfinTvdbTranslationTests(IsolatedAsyncioTestCase):
+    """#162: find_or_create_media_jellyfin must match/create the episode at
+    its canonical TMDB position when one can be resolved, not Jellyfin's raw
+    (potentially TVDB-native) SeasonNumber/EpisodeNumber."""
+
+    def _episode_data(self, **overrides):
+        data = {
+            "media_type": "episode",
+            "jellyfin_id": None,  # skip the CollectionFile fast path
+            "title": "Ep 1",
+            "series_name": "Jujutsu Kaisen",
+            "season_number": 2,
+            "episode_number": 1,
+            "tmdb_id": None,
+            "series_tmdb_id": None,
+        }
+        data.update(overrides)
+        return data
+
+    async def test_translated_position_is_used_for_the_media_match(self):
+        show = SimpleNamespace(id=9, tmdb_id=100, tvdb_id=389597)
+        found_media = SimpleNamespace(id=1, media_type=MediaType.episode, show_id=9, season_number=1, episode_number=25)
+        data = self._episode_data()
+        db = _QueuedResultDB([found_media])  # step 3's match, at the translated position
+
+        with (
+            patch("routers.webhooks._resolve_show_for_episode", AsyncMock(return_value=(show, 100))),
+            patch("routers.webhooks._resolve_tvdb_fallback", AsyncMock(return_value=(389597, "tvdb-key", "en"))),
+            patch("routers.webhooks._resolve_tvdb_episode_to_tmdb_position", AsyncMock(return_value=(1, 25))),
+        ):
+            result = await find_or_create_media_jellyfin(data, db, api_key="tmdb-key")
+
+        self.assertIs(result, found_media)
+        # The raw TVDB-native numbers Jellyfin sent must have been replaced
+        # with the canonical TMDB position before the match/create step.
+        self.assertEqual(data["season_number"], 1)
+        self.assertEqual(data["episode_number"], 25)
+
+    async def test_unresolvable_position_falls_through_to_raw_numbers_unchanged(self):
+        show = SimpleNamespace(id=9, tmdb_id=100, tvdb_id=None)
+        found_media = SimpleNamespace(id=1, media_type=MediaType.episode, show_id=9, season_number=2, episode_number=1)
+        data = self._episode_data()
+        db = _QueuedResultDB([found_media])
+
+        with (
+            patch("routers.webhooks._resolve_show_for_episode", AsyncMock(return_value=(show, 100))),
+            patch("routers.webhooks._resolve_tvdb_fallback", AsyncMock(return_value=(None, None, None))),
+            patch("routers.webhooks._resolve_tvdb_episode_to_tmdb_position", AsyncMock(return_value=None)) as resolve_mock,
+        ):
+            result = await find_or_create_media_jellyfin(data, db, api_key="tmdb-key")
+
+        self.assertIs(result, found_media)
+        self.assertEqual(data["season_number"], 2)
+        self.assertEqual(data["episode_number"], 1)
+        resolve_mock.assert_awaited_once()
 
 
 class _FakeSessionCommitDB:
@@ -401,6 +826,148 @@ class EpisodeForProgressTests(unittest.TestCase):
         self.assertIs(episode, media[0])
         self.assertEqual(pct, 0.0)
         self.assertEqual(secs, 0)
+
+
+class TestBingebaseScrobble(unittest.IsolatedAsyncioTestCase):
+    async def test_maybe_bingebase_scrobble_disabled(self):
+        settings = SimpleNamespace(bingebase_scrobble=False, bingebase_webhook_url="https://bingebase.com/api/webhook")
+        media = SimpleNamespace(media_type="movie", title="Test", tmdb_id=550, imdb_id=None)
+        with patch("httpx.AsyncClient.post") as mock_post:
+            await _maybe_bingebase_scrobble(settings, media, "start", 0.5)
+            mock_post.assert_not_called()
+
+    async def test_maybe_bingebase_scrobble_enabled(self):
+        settings = SimpleNamespace(
+            bingebase_scrobble=True,
+            bingebase_webhook_url="https://bingebase.com/api/webhook",
+            bingebase_api_key="secret-token"
+        )
+        media = SimpleNamespace(media_type="movie", title="Fight Club", tmdb_id=550, imdb_id="tt0137523")
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            await _maybe_bingebase_scrobble(settings, media, "stop", 0.95)
+            mock_post.assert_called_once()
+            args, kwargs = mock_post.call_args
+            self.assertEqual(args[0], "https://bingebase.com/api/webhook")
+            self.assertEqual(kwargs["json"]["Event"], "playback.stop")
+            self.assertEqual(kwargs["json"]["Item"]["ProviderIds"]["Tmdb"], "550")
+            self.assertEqual(kwargs["headers"]["Authorization"], "Bearer secret-token")
+
+
+class BackfillPlexRuntimeTests(IsolatedAsyncioTestCase):
+    """Regression tests for #169: the Now Playing bar's live progress
+    interpolation never engages while Media.runtime is unset, freezing the
+    bar at a flat percentage. Some Plex clients under-report duration_ms on
+    their first play/resume event, so _backfill_plex_runtime tries, in
+    order: the current event's own duration_ms, asking Plex directly for the
+    item, then TMDB - so any event (not just play/resume) can self-heal it."""
+
+    def _movie(self, **overrides):
+        defaults = dict(runtime=None, media_type=MediaType.movie, tmdb_id=550, show_id=None, season_number=None, episode_number=None)
+        return SimpleNamespace(**{**defaults, **overrides})
+
+    def _episode(self, **overrides):
+        defaults = dict(runtime=None, media_type=MediaType.episode, tmdb_id=None, show_id=1, season_number=1, episode_number=1)
+        return SimpleNamespace(**{**defaults, **overrides})
+
+    async def test_noop_when_runtime_already_set(self) -> None:
+        media = self._movie(runtime=42)
+        db = _FakeDB([])
+        with patch("core.plex.get_item", new_callable=AsyncMock) as mock_get_item:
+            await _backfill_plex_runtime(db, media, {"duration_ms": 999999}, SimpleNamespace(url="u", token="t"), "tmdb-key")
+        self.assertEqual(media.runtime, 42)
+        mock_get_item.assert_not_called()
+
+    async def test_uses_current_event_duration_ms_first(self) -> None:
+        media = self._movie()
+        db = _FakeDB([])
+        with patch("core.plex.get_item", new_callable=AsyncMock) as mock_get_item:
+            await _backfill_plex_runtime(db, media, {"duration_ms": 5_400_000}, SimpleNamespace(url="u", token="t"), "tmdb-key")
+        self.assertEqual(media.runtime, 90)
+        mock_get_item.assert_not_called()
+
+    async def test_asks_plex_directly_when_event_duration_missing(self) -> None:
+        media = self._movie()
+        db = _FakeDB([])
+        conn = SimpleNamespace(url="http://plex.local", token="plex-token")
+        with patch("core.plex.get_item", new_callable=AsyncMock, return_value={"duration": 3_600_000}) as mock_get_item:
+            await _backfill_plex_runtime(db, media, {"duration_ms": 0, "plex_rating_key": "123"}, conn, "tmdb-key")
+        mock_get_item.assert_awaited_once_with("http://plex.local", "plex-token", "123")
+        self.assertEqual(media.runtime, 60)
+
+    async def test_falls_back_to_tmdb_movie_when_plex_unavailable(self) -> None:
+        media = self._movie(tmdb_id=550)
+        db = _FakeDB([])
+        with patch("core.tmdb.get_movie", new_callable=AsyncMock, return_value={"runtime": 139}) as mock_get_movie:
+            await _backfill_plex_runtime(db, media, {"duration_ms": 0}, None, "tmdb-key")
+        mock_get_movie.assert_awaited_once_with(550, api_key="tmdb-key")
+        self.assertEqual(media.runtime, 139)
+
+    async def test_falls_back_to_tmdb_episode_via_show_lookup(self) -> None:
+        media = self._episode(show_id=7, season_number=2, episode_number=3)
+        show = SimpleNamespace(id=7, tmdb_id=999)
+        db = _FakeDB([show])
+        with patch("core.tmdb.get_episode", new_callable=AsyncMock, return_value={"runtime": 45}) as mock_get_episode:
+            await _backfill_plex_runtime(db, media, {"duration_ms": 0}, None, "tmdb-key")
+        mock_get_episode.assert_awaited_once_with(999, 2, 3, api_key="tmdb-key")
+        self.assertEqual(media.runtime, 45)
+
+    async def test_leaves_runtime_none_when_every_source_fails(self) -> None:
+        media = self._movie(tmdb_id=None)
+        db = _FakeDB([])
+        await _backfill_plex_runtime(db, media, {"duration_ms": 0}, None, "tmdb-key")
+        self.assertIsNone(media.runtime)
+
+    async def test_no_conn_skips_plex_and_goes_straight_to_tmdb(self) -> None:
+        # Scrobble-only Plex connections have no url/token to call Plex with -
+        # conn=None must not raise, and should fall through to TMDB.
+        media = self._movie(tmdb_id=550)
+        db = _FakeDB([])
+        with patch("core.plex.get_item", new_callable=AsyncMock) as mock_get_item, \
+             patch("core.tmdb.get_movie", new_callable=AsyncMock, return_value={"runtime": 120}):
+            await _backfill_plex_runtime(db, media, {"duration_ms": 0, "plex_rating_key": "123"}, None, "tmdb-key")
+        mock_get_item.assert_not_called()
+        self.assertEqual(media.runtime, 120)
+
+    async def test_connection_with_no_url_or_token_skips_plex_without_crashing(self) -> None:
+        # A webhook-only user may have a MediaServerConnection row that was
+        # never fully filled in (url/token blank) - must behave the same as
+        # conn=None, not attempt the call and definitely not raise.
+        media = self._movie(tmdb_id=550)
+        db = _FakeDB([])
+        conn = SimpleNamespace(url="", token="")
+        with patch("core.plex.get_item", new_callable=AsyncMock) as mock_get_item, \
+             patch("core.tmdb.get_movie", new_callable=AsyncMock, return_value={"runtime": 120}):
+            await _backfill_plex_runtime(db, media, {"duration_ms": 0, "plex_rating_key": "123"}, conn, "tmdb-key")
+        mock_get_item.assert_not_called()
+        self.assertEqual(media.runtime, 120)
+
+    async def test_plex_lookup_raising_does_not_crash_and_falls_back_to_tmdb(self) -> None:
+        # A multi-server user's webhook can arrive from a Plex server other
+        # than the one configured in Scrob - that server won't have this
+        # item, so the lookup can fail in ways get_item's own try/except
+        # might not anticipate. Must not propagate.
+        media = self._movie(tmdb_id=550)
+        db = _FakeDB([])
+        conn = SimpleNamespace(url="http://wrong-server.local", token="tok")
+        with patch("core.plex.get_item", new_callable=AsyncMock, side_effect=RuntimeError("boom")), \
+             patch("core.tmdb.get_movie", new_callable=AsyncMock, return_value={"runtime": 120}):
+            await _backfill_plex_runtime(db, media, {"duration_ms": 0, "plex_rating_key": "123"}, conn, "tmdb-key")
+        self.assertEqual(media.runtime, 120)
+
+    async def test_tmdb_failure_does_not_crash_and_leaves_runtime_none(self) -> None:
+        media = self._movie(tmdb_id=550)
+        db = _FakeDB([])
+        with patch("core.tmdb.get_movie", new_callable=AsyncMock, side_effect=Exception("network error")):
+            await _backfill_plex_runtime(db, media, {"duration_ms": 0}, None, "tmdb-key")
+        self.assertIsNone(media.runtime)
+
+    async def test_malformed_duration_does_not_crash(self) -> None:
+        media = self._movie()
+        db = _FakeDB([])
+        # No tmdb_key, so this isolates the malformed-duration path itself
+        # rather than also exercising the TMDB fallback that follows it.
+        await _backfill_plex_runtime(db, media, {"duration_ms": "not-a-number"}, None, None)
+        self.assertIsNone(media.runtime)
 
 
 if __name__ == "__main__":

@@ -8,16 +8,30 @@ import { api, type MediaItem } from "../lib/api";
 export const prerender = false;
 
 const category = Astro.url.searchParams.get("category") ?? "popular";
-const genre = Astro.url.searchParams.get("genre") ?? "";
-const year = Astro.url.searchParams.get("year") ? Number(Astro.url.searchParams.get("year")) : undefined;
+const genre = Astro.url.searchParams.getAll("genre");
+const year = Astro.url.searchParams.getAll("year").map(Number);
 const minRating = Astro.url.searchParams.get("min_rating") ? Number(Astro.url.searchParams.get("min_rating")) : undefined;
 const status = Astro.url.searchParams.get("status") ?? "";
+const collection = Astro.url.searchParams.getAll("collection");
+const watch = Astro.url.searchParams.getAll("watch");
+const arr = Astro.url.searchParams.getAll("arr");
+const langs = Astro.url.searchParams.getAll("lang");
 const page = Number(Astro.url.searchParams.get("page") ?? 1);
-const { token } = Astro.locals;
+const { token, user } = Astro.locals;
 Astro.response.headers.set("Cache-Control", "no-store");
 
-const settings = await api.auth.getSettings(token!);
-const hasTmdbKey = !!settings?.has_effective_tmdb_key;
+let hasTmdbKey = false;
+let hasSonarr = false;
+if (token) {
+  const settings = await api.auth.getSettings(token);
+  hasTmdbKey = !!settings?.has_effective_tmdb_key;
+  hasSonarr = !!settings?.has_effective_sonarr;
+} else {
+  // Anonymous visitor - only reachable at all when the admin enabled
+  // logged-out navigation, which already implies a global TMDB key.
+  const status = await api.profile.publicAccessStatus().catch(() => ({ enable_logged_out_navigation: false }));
+  hasTmdbKey = status.enable_logged_out_navigation;
+}
 
 let data: { results: MediaItem[]; total_pages: number; page: number } = { results: [], total_pages: 0, page: 1 };
 if (hasTmdbKey) {
@@ -26,10 +40,14 @@ if (hasTmdbKey) {
       type: "series",
       category,
       page,
-      ...(genre ? { genre } : {}),
-      ...(year ? { year } : {}),
+      ...(genre.length ? { genre } : {}),
+      ...(year.length ? { year } : {}),
       ...(minRating ? { min_rating: minRating } : {}),
       ...(status ? { status } : {}),
+      ...(collection.length ? { collection } : {}),
+      ...(watch.length ? { watch } : {}),
+      ...(hasSonarr && arr.length ? { arr } : {}),
+      ...(langs.length ? { original_language: langs.join("|") } : {}),
     }, token);
   } catch (e) {
     console.error("Failed to fetch TMDB show list:", e);
@@ -44,24 +62,41 @@ const TV_GENRES = [
 
 const TV_STATUSES = ["Returning Series", "In Production", "Planned", "Ended", "Canceled"];
 
+const LANGUAGES = [
+  { value: "en", label: "English" }, { value: "nl", label: "Dutch" },
+  { value: "fr", label: "French" }, { value: "de", label: "German" },
+  { value: "es", label: "Spanish" }, { value: "it", label: "Italian" },
+  { value: "pt", label: "Portuguese" }, { value: "ja", label: "Japanese" },
+  { value: "ko", label: "Korean" }, { value: "zh", label: "Chinese" },
+  { value: "sv", label: "Swedish" }, { value: "da", label: "Danish" },
+  { value: "no", label: "Norwegian" }, { value: "tr", label: "Turkish" },
+  { value: "hi", label: "Hindi" },
+];
+
 const currentYear = new Date().getFullYear();
 const years = Array.from({ length: currentYear - 1949 }, (_, i) => currentYear - i);
 
 // Build base URL preserving active filters (without page)
 const baseParams = new URLSearchParams();
 baseParams.set("category", category);
-if (genre) baseParams.set("genre", genre);
-if (year) baseParams.set("year", String(year));
+genre.forEach((v) => baseParams.append("genre", v));
+year.forEach((v) => baseParams.append("year", String(v)));
 if (minRating) baseParams.set("min_rating", String(minRating));
 if (status) baseParams.set("status", status);
+collection.forEach((v) => baseParams.append("collection", v));
+watch.forEach((v) => baseParams.append("watch", v));
+if (hasSonarr) arr.forEach((v) => baseParams.append("arr", v));
+langs.forEach((l) => baseParams.append("lang", l));
 const baseUrl = `/shows?${baseParams.toString()}`;
 ---
 
 <Base title="Explore Shows">
-  <div class="flex items-center gap-1 mb-6 bg-zinc-900 border border-zinc-800 rounded-xl p-1 w-fit">
-    <a href="/shows" class="px-4 py-1.5 rounded-lg text-sm font-semibold bg-blue-600 text-white transition-colors active:scale-95 active:opacity-70">Explore</a>
-    <a href="/collection/shows" class="px-4 py-1.5 rounded-lg text-sm font-medium text-zinc-400 hover:text-zinc-100 transition-colors active:scale-95 active:opacity-70">My Collection</a>
-  </div>
+  {user && (
+    <div class="flex items-center gap-1 mb-6 bg-zinc-900 border border-zinc-800 rounded-xl p-1 w-fit">
+      <a href="/shows" class="px-4 py-1.5 rounded-lg text-sm font-semibold bg-blue-600 text-white transition-colors active:scale-95 active:opacity-70">Explore</a>
+      <a href="/collection/shows" class="px-4 py-1.5 rounded-lg text-sm font-medium text-zinc-400 hover:text-zinc-100 transition-colors active:scale-95 active:opacity-70">My Collection</a>
+    </div>
+  )}
   <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-10">
     <h1 class="page-title">Explore Shows</h1>
 
@@ -87,10 +122,16 @@ const baseUrl = `/shows?${baseParams.toString()}`;
           basePath="/shows"
           extraParams={{ category }}
           sections={[
-            { key: "genre", label: "Genre", options: TV_GENRES.map((g) => ({ value: g, label: g })), selected: genre ? [genre] : [], multi: false },
-            { key: "year", label: "Year", options: years.map((y) => ({ value: String(y), label: String(y) })), selected: year ? [String(year)] : [], multi: false },
+            { key: "genre", label: "Genre", options: TV_GENRES.map((g) => ({ value: g, label: g })), selected: genre },
+            { key: "year", label: "Year", options: years.map((y) => ({ value: String(y), label: String(y) })), selected: year.map(String) },
             { key: "min_rating", label: "Rating", options: [9, 8, 7, 6, 5].map((r) => ({ value: String(r), label: `${r}+ Stars` })), selected: minRating ? [String(minRating)] : [], multi: false },
             { key: "status", label: "Status", options: TV_STATUSES.map((s) => ({ value: s, label: s })), selected: status ? [status] : [], multi: false },
+            ...(user ? [
+              { key: "collection", label: "Collection", options: [{ value: "in", label: "In My Collection" }, { value: "out", label: "Not In My Collection" }], selected: collection },
+              { key: "watch", label: "Watched", options: [{ value: "watched", label: "Watched" }, { value: "unwatched", label: "Unwatched" }, { value: "started", label: "In Progress" }], selected: watch },
+            ] : []),
+            ...(hasSonarr ? [{ key: "arr", label: "Sonarr", options: [{ value: "added", label: "In Sonarr" }, { value: "notadded", label: "Not In Sonarr" }], selected: arr }] : []),
+            { key: "lang", label: "Language", options: LANGUAGES, selected: langs },
           ]}
         />
       </div>

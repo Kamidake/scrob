@@ -250,6 +250,31 @@ class CommentsImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["comments"], 0)
         self.assertEqual(stats["skipped"], 1)
 
+    async def test_malformed_created_at_is_skipped_not_fatal(self) -> None:
+        # A garbage created_at must only drop that one comment - not raise
+        # out of apply_scrob_import and abort every remaining category.
+        # Reachable via a hand-edited or third-party CSV (e.g. the Yamtrack
+        # importer), unlike Trakt's own well-formed export/API dates.
+        data = ScrobImportData(comments={
+            "movies": [
+                {"comment": "Bad date", "created_at": "not-a-real-date", "movie": {"ids": {"tmdb": 1}}},
+                {"comment": "Good date", "created_at": "2026-01-01T00:00:00.000Z", "movie": {"ids": {"tmdb": 2}}},
+            ],
+            "shows": [], "seasons": [], "episodes": [],
+        })
+        db = _FakeSession([[], [], []])
+
+        stats = await apply_scrob_import(
+            db, job_id=1, user_id=1, data=data, api_key=None,
+            **{**_EMPTY_INCLUDE, "include_comments": True},
+        )
+
+        self.assertEqual(stats["comments"], 1)
+        self.assertEqual(stats["errors"], 1)
+        comments = [o for o in db.added if type(o).__name__ == "Comment"]
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0].tmdb_id, 2)
+
 
 class ApiKeysImportTests(unittest.IsolatedAsyncioTestCase):
     async def test_fills_empty_tmdb_key_but_never_touches_scrob_api_key(self) -> None:
@@ -365,6 +390,25 @@ class ImportEndpointValidationTests(unittest.IsolatedAsyncioTestCase):
                 db=None, current_user=SimpleNamespace(id=1),
             )
         self.assertEqual(ctx.exception.status_code, 400)
+
+
+class ParseCollectedAtTests(unittest.TestCase):
+    """The exporter writes collected_at for every collection entry, so a
+    restore should keep those dates instead of restamping the whole
+    collection as added today."""
+
+    def test_reads_the_date_the_exporter_writes(self):
+        # Format comes from core/data_export.py's _iso().
+        entry = {"collected_at": "2019-05-01T08:00:00.000Z"}
+        self.assertEqual(scrob_import._parse_collected_at(entry), datetime(2019, 5, 1, 8, 0, 0))
+
+    def test_offsets_are_converted_to_naive_utc(self):
+        entry = {"collected_at": "2019-05-01T10:00:00+02:00"}
+        self.assertEqual(scrob_import._parse_collected_at(entry), datetime(2019, 5, 1, 8, 0, 0))
+
+    def test_missing_or_malformed_dates_fall_back_to_the_default(self):
+        for entry in ({}, {"collected_at": None}, {"collected_at": ""}, {"collected_at": "nonsense"}):
+            self.assertIsNone(scrob_import._parse_collected_at(entry), entry)
 
 
 if __name__ == "__main__":
