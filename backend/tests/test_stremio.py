@@ -583,12 +583,15 @@ class StremioCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             scalars=lambda: SimpleNamespace(all=lambda: [movie]),
         )
         existing_result = SimpleNamespace(all=lambda: [])
+        # get_dedup_window_minutes's UserSettings lookup (#390) - no configured
+        # override for this test.
+        dedup_window_result = SimpleNamespace(scalar_one_or_none=lambda: None)
         # record_rewatch_progress's own Media lookup for the one new
         # WatchEvent - no-ops since this test isn't exercising rewatch
         # behavior.
         rewatch_media_result = SimpleNamespace(scalar_one_or_none=lambda: None)
         db = SimpleNamespace(
-            execute=AsyncMock(side_effect=[media_result, existing_result, rewatch_media_result]),
+            execute=AsyncMock(side_effect=[media_result, existing_result, dedup_window_result, rewatch_media_result]),
             add=MagicMock(),
             commit=AsyncMock(),
         )
@@ -622,9 +625,9 @@ class StremioCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             scalars=lambda: SimpleNamespace(all=lambda: [connection]),
         )
         settings_result = SimpleNamespace(scalar_one_or_none=lambda: settings)
-        files_result = SimpleNamespace(
-            scalars=lambda: SimpleNamespace(all=lambda: []),
-        )
+        # _push_watch_state selects (CollectionFile, Collection.media_id) and
+        # reads it via .all() directly, not .scalars().all().
+        files_result = SimpleNamespace(all=lambda: [])
         movie = Media(id=10, tmdb_id=603, media_type=MediaType.movie, title="The Matrix")
         stremio_media_result = SimpleNamespace(
             scalars=lambda: SimpleNamespace(all=lambda: [movie]),
@@ -843,9 +846,12 @@ class StremioLinkReconnectTests(unittest.IsolatedAsyncioTestCase):
         existing_result = SimpleNamespace(
             all=lambda: [(10, datetime(2026, 8, 13, 10, 0, 0))],
         )
+        # get_dedup_window_minutes's UserSettings lookup (#390) - no configured
+        # override for this test.
+        dedup_window_result = SimpleNamespace(scalar_one_or_none=lambda: None)
         rewatch_media_result = SimpleNamespace(scalar_one_or_none=lambda: None)
         db = SimpleNamespace(
-            execute=AsyncMock(side_effect=[media_result, existing_result, rewatch_media_result]),
+            execute=AsyncMock(side_effect=[media_result, existing_result, dedup_window_result, rewatch_media_result]),
             add=MagicMock(),
             commit=AsyncMock(),
         )

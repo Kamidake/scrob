@@ -49,6 +49,7 @@ class UserSettings(Base):
     id             : Mapped[int]            = mapped_column(Integer, primary_key=True)
     user_id        : Mapped[int]            = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
     tmdb_api_key   : Mapped[Optional[str]]  = mapped_column(String(255))
+    rpdb_api_key   : Mapped[Optional[str]]  = mapped_column(String(255))
 
     # Radarr integration
     radarr_url             : Mapped[Optional[str]] = mapped_column(String(500))
@@ -80,13 +81,21 @@ class UserSettings(Base):
     # Trakt inbound sync flags (Trakt → Scrob)
     trakt_sync_watched       : Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     trakt_sync_ratings       : Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    # Defaults off, like trakt_sync_lists - pulling a dropped show could
+    # silently hide something from Next Up/Calendar the user never touched
+    # in Scrob, which would be a surprising side effect for existing users.
+    trakt_sync_dropped       : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     trakt_history_cursor_at  : Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     # Trakt outbound push flags (Scrob → Trakt)
     trakt_push_watched       : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     trakt_push_ratings       : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     trakt_push_collection    : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    trakt_push_dropped       : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     trakt_scrobble           : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    # Show Trakt's public comments (not the user's own) on movie/show/season/episode pages
+    trakt_show_comments      : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
     # Trakt list import/export
     trakt_sync_lists         : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
@@ -97,8 +106,10 @@ class UserSettings(Base):
     trakt_auto_sync_interval : Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     trakt_auto_push_interval : Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
-    # TVDB API key (optional personal override)
+    # TVDB API key (optional personal override) + optional subscriber PIN, which
+    # TheTVDB v4 requires alongside a subscriber-supported key on /login (#322).
     tvdb_api_key             : Mapped[Optional[str]]  = mapped_column(String(255))
+    tvdb_subscriber_pin      : Mapped[Optional[str]]  = mapped_column(String(255))
 
     # Simkl OAuth credentials (PIN flow — client_id only, no secret needed)
     simkl_client_id          : Mapped[Optional[str]]  = mapped_column(String(255))
@@ -121,6 +132,32 @@ class UserSettings(Base):
     simkl_auto_sync_interval : Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     simkl_auto_push_interval : Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
+    # WeTrakr OAuth tokens — no client_id/secret columns: Scrob ships a single
+    # app-owned client_id (core/wetrakr.py), never a per-user one (the WeTrakr
+    # dev asked for this, unlike Trakt/Simkl's per-user-app model).
+    wetrakr_access_token       : Mapped[Optional[str]]      = mapped_column(String(2000))
+    wetrakr_refresh_token      : Mapped[Optional[str]]      = mapped_column(String(2000))
+    wetrakr_token_expires_at   : Mapped[Optional[int]]      = mapped_column(BigInteger)  # Unix timestamp
+    wetrakr_device_code        : Mapped[Optional[str]]      = mapped_column(String(255))  # Temporary during device auth
+
+    # WeTrakr inbound sync flags (WeTrakr → Scrob)
+    wetrakr_sync_watched       : Mapped[bool] = mapped_column(Boolean, nullable=False, default=True,  server_default="true")
+    wetrakr_sync_ratings       : Mapped[bool] = mapped_column(Boolean, nullable=False, default=True,  server_default="true")
+
+    # WeTrakr outbound push flags (Scrob → WeTrakr)
+    wetrakr_push_watched       : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    wetrakr_push_ratings       : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    # WeTrakr lists + comments (both directions)
+    wetrakr_sync_lists         : Mapped[bool] = mapped_column(Boolean, nullable=False, default=True,  server_default="true")
+    wetrakr_push_lists         : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    wetrakr_sync_comments      : Mapped[bool] = mapped_column(Boolean, nullable=False, default=True,  server_default="true")
+    wetrakr_push_comments      : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    # WeTrakr auto sync/push interval, in hours (null = disabled)
+    wetrakr_auto_sync_interval : Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    wetrakr_auto_push_interval : Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     preferences    : Mapped[Optional[dict]] = mapped_column(JSONB)
     blur_explicit   : Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     time_format_24h : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
@@ -128,17 +165,40 @@ class UserSettings(Base):
     shuffle_next_up : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     minimalist_next_up : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     next_up_hidden_shows : Mapped[Optional[list[int]]] = mapped_column(JSONB, server_default="'[]'")
+    # Dropped is stronger than hidden - unlike next_up_hidden_shows, dropped
+    # items are also excluded from the Calendar and from Discover/
+    # recommendations (#117). dropped_shows holds local Show.id values (same
+    # convention as next_up_hidden_shows); dropped_movies holds local
+    # Media.id values (movies have no next-up/hidden precedent to match).
+    dropped_shows  : Mapped[Optional[list[int]]] = mapped_column(JSONB, server_default="'[]'")
+    dropped_movies : Mapped[Optional[list[int]]] = mapped_column(JSONB, server_default="'[]'")
     hide_watched_from_recently_added : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Collapse consecutive same-show episodes within a date on the History
+    # page into one row instead of listing each individually (#391).
+    condense_history_by_show : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Prompt to rate an item right after it finishes playing (homepage Now
+    # Playing bar drops the session -> star-rating popup), separately per type (#177).
+    rate_prompt_movies   : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    rate_prompt_episodes : Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    # Minutes within which a second watch of the same movie/episode is treated
+    # as a duplicate of an existing one and not recorded again, regardless of
+    # which source (webhook, import, manual entry, ...) either one came from
+    # (#390). NULL/0 means "use the built-in minimum only" - see
+    # core.watch_dedup.DEFAULT_DEDUP_WINDOW_MINUTES.
+    duplicate_watch_window_minutes : Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     # MDBList — API key authentication
     mdblist_api_key: Mapped[Optional[str]] = mapped_column(String(255))
     mdblist_sync_watched: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     mdblist_sync_ratings: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     mdblist_sync_watchlist: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    mdblist_sync_dropped: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     mdblist_push_watched: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     mdblist_push_ratings: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     mdblist_push_watchlist: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     mdblist_push_collection: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    mdblist_push_dropped: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     mdblist_scrobble: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
     # MDBList auto sync/push interval, in hours (null = disabled)

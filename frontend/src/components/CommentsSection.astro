@@ -3,28 +3,39 @@ import { api, type Comment } from "../lib/api";
 
 interface Props {
   mediaType: string;
-  tmdbId: number;
+  tmdbId?: number | null;
+  // Only for a TVDB-only show (no TMDB counterpart); ignored when tmdbId is set.
+  tvdbId?: number | null;
   seasonNumber?: number;
   episodeNumber?: number;
 }
 
-const { mediaType, tmdbId, seasonNumber, episodeNumber } = Astro.props;
+const { mediaType, tvdbId, seasonNumber, episodeNumber } = Astro.props;
+const tmdbId = Astro.props.tmdbId ?? undefined;
+const commentTvdbId = tmdbId ? undefined : (tvdbId ?? undefined);
 const token = Astro.cookies.get("token")?.value;
 const user = Astro.locals.user;
+const loginNextUrl = `/login?next=${encodeURIComponent(Astro.url.pathname + Astro.url.search)}`;
+
+const { disable_comments: commentsDisabled } = await api.profile.publicAccessStatus().catch(() => ({ disable_comments: false }));
 
 let comments: Comment[] = [];
-try {
-  comments = await api.comments.list({
-    media_type: mediaType,
-    tmdb_id: tmdbId,
-    season_number: seasonNumber,
-    episode_number: episodeNumber
-  }, token);
-} catch (e) {
-  console.error("Failed to load comments", e);
+if (!commentsDisabled) {
+  try {
+    comments = await api.comments.list({
+      media_type: mediaType,
+      tmdb_id: tmdbId,
+      tvdb_id: commentTvdbId,
+      season_number: seasonNumber,
+      episode_number: episodeNumber
+    }, token);
+  } catch (e) {
+    console.error("Failed to load comments", e);
+  }
 }
 ---
 
+{!commentsDisabled && (
 <div class="mt-24 border-zinc-900 pt-16 mb-20">
   <div class="flex items-center justify-between mb-10">
     <h2 class="text-3xl font-black text-zinc-100 tracking-tighter uppercase flex items-center gap-3">
@@ -43,7 +54,8 @@ try {
       <div class="mb-12 bg-zinc-900/40 border border-zinc-800 p-6 rounded-3xl backdrop-blur-sm">
         <form id="comment-form" class="space-y-4">
           <input type="hidden" name="mediaType" value={mediaType} />
-          <input type="hidden" name="tmdbId" value={tmdbId} />
+          {tmdbId !== undefined && <input type="hidden" name="tmdbId" value={tmdbId} />}
+          {commentTvdbId !== undefined && <input type="hidden" name="tvdbId" value={commentTvdbId} />}
           {seasonNumber !== undefined && <input type="hidden" name="seasonNumber" value={seasonNumber} />}
           {episodeNumber !== undefined && <input type="hidden" name="episodeNumber" value={episodeNumber} />}
 
@@ -78,7 +90,7 @@ try {
       </div>
     ) : (
       <div class="mb-12 p-8 bg-zinc-900/20 border border-dashed border-zinc-800 rounded-3xl text-center">
-        <p class="text-zinc-400 font-medium">Please <a href="/login" class="text-blue-500 hover:underline">log in</a> to leave a comment.</p>
+        <p class="text-zinc-400 font-medium">Please <a href={loginNextUrl} class="text-blue-500 hover:underline">log in</a> to leave a comment.</p>
       </div>
     )}
 
@@ -184,7 +196,9 @@ try {
     </div>
   </div>
 </div>
+)}
 
+{!commentsDisabled && (
 <script define:vars={{ token, currentUserId: user?.id, isAdmin: user?.role === 'admin' }}>
   function esc(s) {
     if (s == null) return '';
@@ -267,7 +281,8 @@ try {
       const formData = new FormData(form);
       const content = formData.get('content');
       const mediaType = formData.get('mediaType');
-      const tmdbId = parseInt(formData.get('tmdbId'));
+      const tmdbId = formData.get('tmdbId') ? parseInt(formData.get('tmdbId')) : undefined;
+      const tvdbId = formData.get('tvdbId') ? parseInt(formData.get('tvdbId')) : undefined;
       const seasonNumber = formData.get('seasonNumber') ? parseInt(formData.get('seasonNumber')) : undefined;
       const episodeNumber = formData.get('episodeNumber') ? parseInt(formData.get('episodeNumber')) : undefined;
       const isSpoiler = document.getElementById('is-spoiler-checkbox')?.checked ?? false;
@@ -287,6 +302,7 @@ try {
           body: JSON.stringify({
             media_type: mediaType,
             tmdb_id: tmdbId,
+            tvdb_id: tvdbId,
             season_number: seasonNumber,
             episode_number: episodeNumber,
             content: content,
@@ -460,3 +476,4 @@ try {
 
   attachListeners();
 </script>
+)}

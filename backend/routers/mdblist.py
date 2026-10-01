@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from core import mdblist as mdblist_client
 from core.enrichment import enrich_media, is_unmapped_tvdb_episode, create_media_safely
 from core.rewatch import record_rewatch_progress
+from core.watch_dedup import get_dedup_window_minutes
 from db import engine, get_db
 from dependencies import get_current_user
 from models.base import CollectionSource, MediaType
@@ -27,9 +28,11 @@ from models.show import Show
 from models.sync import SyncJob, SyncStatus
 from models.users import User, UserSettings
 from routers.trakt import (
+    _apply_dropped_shows_import,
     _get_or_create_episode_media,
     _get_or_create_movie_media,
     _get_or_create_show,
+    _local_dropped_show_tmdb_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,6 +84,48 @@ def _entry_data(kind: str, entry: dict[str, Any]) -> dict[str, Any]:
     singular = {"movies": "movie", "shows": "show", "seasons": "season", "episodes": "episode"}[kind]
     nested = entry.get(singular)
     return nested if isinstance(nested, dict) else entry
+
+
+def _describe_not_found(entry: dict[str, Any], show_titles: dict[int, str] | None = None) -> str:
+    """One-line human summary of an item MDBList reported as not found, for the
+    push job's WARNING log (#340). Defensive about MDBList's echo shape - it
+    carries at least the ids we sent, sometimes a title and season/episode.
+
+    An episode entry with no id of its own instead carries the show tmdb
+    id(s) core.mdblist._push recovered locally (see _index_episode_shows) in
+    "_candidate_show_tmdb_ids" - show_titles resolves those to a name where
+    known, so "episode no-id S6" becomes "episode no-id S6 (show: Poirot)"
+    or, when more than one show shares that season number in this batch,
+    "(possibly: Poirot, Marple)" (#368)."""
+    kind = entry.get("kind") or "item"
+    item = entry.get("item") if isinstance(entry.get("item"), dict) else {}
+    ids = item.get("ids") if isinstance(item.get("ids"), dict) else {}
+    tmdb = ids.get("tmdb") or item.get("tmdb") or item.get("tmdb_id")
+    imdb = ids.get("imdb") or item.get("imdb")
+    ref = f"tmdb:{tmdb}" if tmdb is not None else (f"imdb:{imdb}" if imdb else "no-id")
+
+    sxe = ""
+    seasons = item.get("seasons")
+    if isinstance(seasons, list) and seasons and isinstance(seasons[0], dict):
+        s0 = seasons[0]
+        sxe = f" S{s0.get('number')}"
+        eps = s0.get("episodes")
+        if isinstance(eps, list) and eps and isinstance(eps[0], dict) and eps[0].get("number") is not None:
+            sxe += f"E{eps[0]['number']}"
+    elif item.get("season") is not None:
+        sxe = f" S{item['season']}"
+        if item.get("episode") is not None:
+            sxe += f"E{item['episode']}"
+
+    show_ref = ""
+    candidates = item.get("_candidate_show_tmdb_ids")
+    if ref == "no-id" and isinstance(candidates, list) and candidates:
+        names = [(show_titles or {}).get(c) or f"tmdb:{c}" for c in candidates]
+        label = "show" if len(names) == 1 else "possibly"
+        show_ref = f" ({label}: {', '.join(names)})"
+
+    title = item.get("title")
+    return f"{kind} {ref}{sxe}" + (f' "{title}"' if title else "") + show_ref
 
 
 def _tmdb_id(data: dict[str, Any]) -> int | None:
@@ -410,6 +455,10 @@ async def _import_watched(
         existing[media_id].append(watched_at)
     changed: set[int] = set()
 
+    # The user's configured duplicate-watch window (#390) only ever widens
+    # this beyond its tuned default, never narrows it - see WATCH_DEDUP_WINDOW.
+    dedup_window = max(WATCH_DEDUP_WINDOW, timedelta(minutes=await get_dedup_window_minutes(db, user_id)))
+
     # MDBList's /sync/watched "shows" entries are rollup wrappers (a show's
     # own last_watched_at just mirrors its most recently watched episode) —
     # they carry no per-episode data of their own. Importing them as watch
@@ -425,7 +474,7 @@ async def _import_watched(
                         continue
                     watched_at = _utc_naive(entry.get("watched_at") or entry.get("last_watched_at"))
                     if any(
-                        existing_at is not None and abs(watched_at - existing_at) <= WATCH_DEDUP_WINDOW
+                        existing_at is not None and abs(watched_at - existing_at) <= dedup_window
                         for existing_at in existing.get(media.id, [])
                     ):
                         stats["skipped"] += 1
@@ -601,12 +650,12 @@ async def _import_watchlist(
 
 
 async def run_mdblist_sync(user_id: int, job_id: int) -> None:
-    from routers.sync import SyncCancelled, _raise_if_cancelled
+    from routers.sync import SyncCancelled, _raise_if_cancelled, _short_error
     session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with session_factory() as db:
         try:
             await db.execute(
-                update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.running)
+                update(SyncJob).where(SyncJob.id == job_id).values(status=SyncStatus.running, current_step="Pulling from MDBList")
             )
             await db.commit()
 
@@ -628,6 +677,9 @@ async def run_mdblist_sync(user_id: int, job_id: int) -> None:
             if settings.mdblist_sync_watchlist:
                 labels.append("watchlist")
                 requests.append(mdblist_client.get_watchlist(settings.mdblist_api_key))
+            if settings.mdblist_sync_dropped:
+                labels.append("dropped")
+                requests.append(mdblist_client.get_dropped(settings.mdblist_api_key))
 
             import asyncio
 
@@ -672,6 +724,10 @@ async def run_mdblist_sync(user_id: int, job_id: int) -> None:
                 await _import_watchlist(
                     db, user_id, snapshots["watchlist"], tmdb_key, external_cache, stats
                 )
+            if "dropped" in snapshots:
+                stats["dropped"] = await _apply_dropped_shows_import(
+                    db, user_id, snapshots["dropped"].get("shows", [])
+                )
             await db.commit()
 
             # A pull only populates scrob's own data — it never automatically pushes to
@@ -698,7 +754,7 @@ async def run_mdblist_sync(user_id: int, job_id: int) -> None:
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(
                     status=SyncStatus.failed,
-                    error_message=str(exc),
+                    error_message=_short_error(exc),
                 )
             )
             await db.commit()
@@ -733,7 +789,7 @@ async def _load_shows_for_episodes(db: AsyncSession, media_by_id: dict[int, Medi
 
 
 async def run_mdblist_push(user_id: int, job_id: int) -> None:
-    from routers.sync import SyncCancelled, _raise_if_cancelled
+    from routers.sync import SyncCancelled, _raise_if_cancelled, _short_error
     session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with session_factory() as db:
         try:
@@ -748,6 +804,23 @@ async def run_mdblist_push(user_id: int, job_id: int) -> None:
             settings = settings_result.scalar_one_or_none()
             if not settings or not settings.mdblist_api_key:
                 raise RuntimeError("MDBList API key is not configured")
+
+            # Reconcile dropped shows MDBList is missing - the one-shot push at
+            # drop time is best-effort and nothing else ever retried it (#329).
+            dropped_to_push: list[int] = []
+            if settings.mdblist_push_dropped:
+                try:
+                    local_dropped = await _local_dropped_show_tmdb_ids(db, settings)
+                    if local_dropped:
+                        remote = await mdblist_client.get_dropped(settings.mdblist_api_key)
+                        remote_tmdb = {
+                            (it.get("show") or {}).get("ids", {}).get("tmdb")
+                            for it in remote.get("shows", [])
+                        }
+                        remote_tmdb.discard(None)
+                        dropped_to_push = sorted(local_dropped - remote_tmdb)
+                except Exception as exc:
+                    logger.warning("MDBList push job %s: could not reconcile dropped shows: %s", job_id, exc)
 
             watched_rows: list[tuple[int, datetime]] = []
             rating_rows: list[tuple[int, int | None, float, datetime | None]] = []
@@ -850,7 +923,7 @@ async def run_mdblist_push(user_id: int, job_id: int) -> None:
             total_items = sum(
                 mdblist_client._count_leaf_items(payload)
                 for payload in (watched_payload, ratings_payload, watchlist_payload, collection_payload)
-            )
+            ) + len(dropped_to_push)
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(total_items=total_items)
             )
@@ -859,7 +932,8 @@ async def run_mdblist_push(user_id: int, job_id: int) -> None:
             print(
                 f"MDBList push job {job_id}: queued "
                 f"{len(watched_rows)} watched, {len(rating_rows)} ratings, "
-                f"{len(watchlist_ids)} watchlist, {len(collected_rows)} collection "
+                f"{len(watchlist_ids)} watchlist, {len(collected_rows)} collection, "
+                f"{len(dropped_to_push)} dropped "
                 f"({total_items} payload entries after merging by show)."
             )
 
@@ -892,9 +966,24 @@ async def run_mdblist_push(user_id: int, job_id: int) -> None:
                 results["collection"] = await mdblist_client.push_collection(
                     settings.mdblist_api_key, collection_payload, on_batch=_report_progress
                 )
+            if dropped_to_push:
+                await mdblist_client.push_dropped_batch(
+                    settings.mdblist_api_key, dropped_to_push, _iso_utc(None)
+                )
+                results["dropped"] = {"submitted": len(dropped_to_push), "not_found": 0, "batches": 1}
 
             submitted = sum(result["submitted"] for result in results.values())
             not_found = sum(result["not_found"] for result in results.values())
+
+            # MDBList echoes the items it couldn't match back in each response.
+            # Pull them out of the per-target results (keeps SyncJob.stats
+            # lean) so they can be logged and stored once, flat, with the
+            # target name attached (#340).
+            not_found_items: list[dict[str, Any]] = []
+            for name, r in results.items():
+                for entry in r.pop("not_found_items", []) or []:
+                    not_found_items.append({"target": name, **entry})
+
             breakdown = ", ".join(
                 f"{name}: {r['submitted']} submitted"
                 + (f" ({r['not_found']} not found on MDBList)" if r["not_found"] else "")
@@ -905,12 +994,39 @@ async def run_mdblist_push(user_id: int, job_id: int) -> None:
                 f"MDBList push job {job_id} completed. {breakdown}. "
                 f"Total: {submitted} submitted, {not_found} not found."
             )
+            if not_found_items:
+                # Resolve whatever show tmdb ids _index_episode_shows recovered
+                # for the id-less episode entries above to a title, so the log
+                # reads "(show: Poirot)" instead of a second tmdb id (#368).
+                candidate_ids = {
+                    tmdb_id
+                    for it in not_found_items
+                    for tmdb_id in (it.get("item") or {}).get("_candidate_show_tmdb_ids") or []
+                }
+                show_titles: dict[int, str] = {}
+                if candidate_ids:
+                    rows = await db.execute(
+                        select(Show.tmdb_id, Show.title).where(Show.tmdb_id.in_(candidate_ids))
+                    )
+                    show_titles = dict(rows.all())
+                shown = "; ".join(_describe_not_found(it, show_titles) for it in not_found_items[:50])
+                more = f" (+{not_found - len(not_found_items[:50])} more)" if not_found > 50 else ""
+                logger.warning(
+                    "MDBList push job %s: %d item(s) not found on MDBList: %s%s",
+                    job_id, not_found, shown, more,
+                )
+
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(
                     status=SyncStatus.completed,
                     processed_items=submitted,
                     errors=not_found,
-                    stats={"submitted": submitted, "not_found": not_found, "targets": results},
+                    stats={
+                        "submitted": submitted,
+                        "not_found": not_found,
+                        "not_found_items": not_found_items,
+                        "targets": results,
+                    },
                 )
             )
             await db.commit()
@@ -930,7 +1046,7 @@ async def run_mdblist_push(user_id: int, job_id: int) -> None:
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(
                     status=SyncStatus.failed,
-                    error_message=str(exc),
+                    error_message=_short_error(exc),
                 )
             )
             await db.commit()
@@ -953,7 +1069,7 @@ async def sync_mdblist(
 ):
     result = await db.execute(select(UserSettings).where(UserSettings.user_id == current_user.id))
     settings = _require_key(result.scalar_one_or_none())
-    if not any((settings.mdblist_sync_watched, settings.mdblist_sync_ratings, settings.mdblist_sync_watchlist)):
+    if not any((settings.mdblist_sync_watched, settings.mdblist_sync_ratings, settings.mdblist_sync_watchlist, settings.mdblist_sync_dropped)):
         raise HTTPException(status_code=400, detail="Enable at least one MDBList pull option")
 
     job = SyncJob(user_id=current_user.id, source=CollectionSource.mdblist, status=SyncStatus.pending)
@@ -972,7 +1088,8 @@ async def push_mdblist(
 ):
     result = await db.execute(select(UserSettings).where(UserSettings.user_id == current_user.id))
     settings = _require_key(result.scalar_one_or_none())
-    if not any((settings.mdblist_push_watched, settings.mdblist_push_ratings, settings.mdblist_push_watchlist, settings.mdblist_push_collection)):
+    if not any((settings.mdblist_push_watched, settings.mdblist_push_ratings, settings.mdblist_push_watchlist,
+                settings.mdblist_push_collection, settings.mdblist_push_dropped)):
         raise HTTPException(status_code=400, detail="Enable at least one MDBList push option")
 
     job = SyncJob(

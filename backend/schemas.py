@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator, model_validator
 from typing import Optional
 from datetime import datetime
 from models.base import UserRole, MediaType, PrivacyLevel
@@ -12,6 +12,16 @@ class UserCreate(UserBase):
     password: str
 
 class User(UserBase):
+    # Overrides UserBase's EmailStr - this is a response model, serializing
+    # an email address already stored in the DB, not validating one being
+    # submitted. OIDC auto-provisioning (routers/oidc.py) stores whatever the
+    # identity provider's claim contains with no format check at all (it's
+    # trusting an already-authenticated external identity, not collecting a
+    # deliverable address) - a self-hosted IdP on a reserved-use domain like
+    # .home.arpa is enough to fail EmailStr, which used to break every
+    # /auth/me call for that user - i.e. lock them out of the app entirely
+    # right after a successful login (#293).
+    email: str
     id: int
     api_key: str
     display_name: str
@@ -43,6 +53,44 @@ class Token(BaseModel):
 class TokenPayload(BaseModel):
     sub: Optional[int] = None
 
+
+# --- OAuth 2.0 Device Authorization Grant (RFC 8628), #331 ---
+
+class DeviceCodeRequest(BaseModel):
+    client_name: Optional[str] = None
+    scope: Optional[str] = None
+
+class DeviceCodeResponse(BaseModel):
+    device_code: str
+    user_code: str
+    verification_uri: str
+    verification_uri_complete: str
+    expires_in: int
+    interval: int
+
+class DeviceApproveRequest(BaseModel):
+    user_code: str
+    action: str  # "approve" | "deny"
+    # Optional user-chosen label, set on the approval screen; falls back to the
+    # name the client sent with /device/code.
+    name: Optional[str] = None
+
+class DevicePendingResponse(BaseModel):
+    client_name: str
+    scope: str
+    requested_at: datetime
+
+class DeviceGrantItem(BaseModel):
+    id: int
+    client_name: str
+    scope: str
+    created_at: datetime
+    approved_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
 class TotpSetupResponse(BaseModel):
     provisioning_uri: str
     secret: str
@@ -71,11 +119,14 @@ class TotpBackupCodesResponse(BaseModel):
 
 class UserSettings(BaseModel):
     tmdb_api_key: Optional[str] = None
+    rpdb_api_key: Optional[str] = Field(default=None, max_length=255)
+    has_rpdb_key: bool = False
     has_effective_tmdb_key: bool = False
     has_global_tmdb_key: bool = False
 
     # TVDB
     tvdb_api_key: Optional[str] = None
+    tvdb_subscriber_pin: Optional[str] = None
     has_global_tvdb_key: bool = False
     has_effective_tvdb_key: bool = False
 
@@ -105,12 +156,15 @@ class UserSettings(BaseModel):
     trakt_sync_watched: Optional[bool] = None
     trakt_sync_ratings: Optional[bool] = None
     trakt_sync_lists: Optional[bool] = None
+    trakt_sync_dropped: Optional[bool] = None
     trakt_watchlist_split: Optional[bool] = None
     trakt_push_watched: Optional[bool] = None
     trakt_push_ratings: Optional[bool] = None
     trakt_push_collection: Optional[bool] = None
+    trakt_push_dropped: Optional[bool] = None
     trakt_push_lists: Optional[bool] = None
     trakt_scrobble: Optional[bool] = None
+    trakt_show_comments: Optional[bool] = None
     trakt_auto_sync_interval: Optional[float] = None
     trakt_auto_push_interval: Optional[float] = None
 
@@ -126,16 +180,33 @@ class UserSettings(BaseModel):
     simkl_auto_sync_interval: Optional[float] = None
     simkl_auto_push_interval: Optional[float] = None
 
+    # WeTrakr — single Scrob-owned app key (core/wetrakr.py), no client_id/secret
+    # field here; OAuth tokens managed via /wetrakr/* endpoints
+    wetrakr_connected: Optional[bool] = None  # read-only, derived from token presence
+    wetrakr_sync_watched: Optional[bool] = None
+    wetrakr_sync_ratings: Optional[bool] = None
+    wetrakr_push_watched: Optional[bool] = None
+    wetrakr_push_ratings: Optional[bool] = None
+    wetrakr_sync_lists: Optional[bool] = None
+    wetrakr_push_lists: Optional[bool] = None
+    wetrakr_sync_comments: Optional[bool] = None
+    wetrakr_push_comments: Optional[bool] = None
+    wetrakr_auto_sync_interval: Optional[float] = None
+    wetrakr_auto_push_interval: Optional[float] = None
+
     # MDBList — API key authentication
     mdblist_api_key: Optional[str] = None
     mdblist_connected: Optional[bool] = None  # read-only, validated by /auth/connection-status
+    has_global_mdblist_key: bool = False  # read-only; global key is for list imports only
     mdblist_sync_watched: Optional[bool] = None
     mdblist_sync_ratings: Optional[bool] = None
     mdblist_sync_watchlist: Optional[bool] = None
+    mdblist_sync_dropped: Optional[bool] = None
     mdblist_push_watched: Optional[bool] = None
     mdblist_push_ratings: Optional[bool] = None
     mdblist_push_watchlist: Optional[bool] = None
     mdblist_push_collection: Optional[bool] = None
+    mdblist_push_dropped: Optional[bool] = None
     mdblist_scrobble: Optional[bool] = None
     mdblist_auto_sync_interval: Optional[float] = None
     mdblist_auto_push_interval: Optional[float] = None
@@ -155,6 +226,16 @@ class UserSettings(BaseModel):
     shuffle_next_up: Optional[bool] = None
     minimalist_next_up: Optional[bool] = None
     hide_watched_from_recently_added: Optional[bool] = None
+    condense_history_by_show: Optional[bool] = None
+    rate_prompt_movies: Optional[bool] = None
+    rate_prompt_episodes: Optional[bool] = None
+    duplicate_watch_window_minutes: Optional[int] = Field(default=None, ge=0)
+
+    @field_validator("rpdb_api_key", mode="before")
+    @classmethod
+    def normalize_rpdb_api_key(cls, value):
+        from core.rpdb import normalize_api_key
+        return normalize_api_key(value) if isinstance(value, str) or value is None else value
 
     class Config:
         from_attributes = True
@@ -188,6 +269,7 @@ class ArvioConnectionTestRequest(BaseModel):
 
 class ApiKeyTestRequest(BaseModel):
     key: SecretStr
+    pin: Optional[SecretStr] = None  # TVDB subscriber PIN, ignored by other providers
 
 
 class ServiceConnectionTestRequest(BaseModel):
@@ -233,10 +315,13 @@ class MediaServerConnectionBase(BaseModel):
     watchlist_monitored_users: Optional[list[str]] = None
     plex_sync_watchlist: bool = False
     plex_push_watchlist: bool = False
+    plex_account_id: Optional[str] = None
+    plex_machine_identifier: Optional[str] = None
 
 
 class MediaServerConnectionCreate(MediaServerConnectionBase):
-    pass
+    # Account-level token from "Login with Plex"; never echoed back in responses.
+    plex_auth_token: Optional[str] = None
 
 
 class MediaServerConnectionUpdate(BaseModel):
@@ -307,7 +392,12 @@ class PasswordUpdate(BaseModel):
     new_password: str
 
 class WatchEventCreate(BaseModel):
-    tmdb_id: int
+    # Any one of media_id / tmdb_id / tvdb_id identifies the item (see
+    # core/identity.py). tmdb_id used to be mandatory; a TVDB-only episode
+    # has none, so clients send media_id (or tvdb_id + series_tvdb_id context).
+    tmdb_id: Optional[int] = None
+    tvdb_id: Optional[int] = None
+    media_id: Optional[int] = None
     media_type: MediaType
     watched_at: Optional[datetime] = None  # omitted = now; explicit null = unknown date
     completed: bool = True
@@ -315,6 +405,10 @@ class WatchEventCreate(BaseModel):
     series_tvdb_id: Optional[int] = None  # lets the show be linked to TVDB (see #101) without requiring a prior visit to its TVDB page
     season_number: Optional[int] = None
     episode_number: Optional[int] = None
+    # Set after the user confirms a "this looks like a duplicate, add anyway?"
+    # prompt (see the 409 duplicate_watch response from POST /history), to
+    # record it despite an existing watch within the dedup window (#390).
+    force: bool = False
 
 
 class ManualSessionStart(BaseModel):
@@ -398,7 +492,9 @@ class PublicProfileResponse(BaseModel):
 
 class GlobalSettings(BaseModel):
     tmdb_api_key           : Optional[str] = None
+    mdblist_api_key        : Optional[str] = None
     tvdb_api_key           : Optional[str] = None
+    tvdb_subscriber_pin    : Optional[str] = None
     radarr_url             : Optional[str] = None
     radarr_token           : Optional[str] = None
     radarr_root_folder     : Optional[str] = None
@@ -415,8 +511,9 @@ class GlobalSettings(BaseModel):
     radarr_customize_on_add     : bool = False
     sonarr_customize_on_add     : bool = False
     image_cache_enabled         : bool = False
-    image_cache_limit_gb        : Optional[int] = None
+    image_cache_limit_gb        : Optional[float] = None
     enable_logged_out_navigation: bool = False
+    disable_comments            : bool = False
 
     class Config:
         from_attributes = True
@@ -445,6 +542,19 @@ class AdminUser(BaseModel):
     is_admin   : bool
     api_key    : str
     created_at : datetime
+    avatar_url : Optional[str] = None
+    totp_enabled : bool = False
 
     class Config:
         from_attributes = True
+
+
+class AdminPasswordReset(BaseModel):
+    password : str = Field(min_length=1)
+
+
+class AdminUserCreate(BaseModel):
+    username : str = Field(min_length=1, max_length=150)
+    email    : EmailStr
+    password : str = Field(min_length=1)
+    is_admin : bool = False

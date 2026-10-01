@@ -1,5 +1,5 @@
-"""Episode calendar: real per-day schedule for the next 14 days, for shows
-the user is collecting or watching (#194).
+"""Episode calendar: real per-day schedule for the last 7 days and next 14
+days, for shows the user is collecting or watching (#194, #433).
 
 The original attempt at this (#243) built the calendar from each show's
 next_episode_to_air/last_episode_to_air - single TMDB pointers, not a real
@@ -17,7 +17,7 @@ exists and warms it in the background otherwise.
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, Query
@@ -25,6 +25,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from core.config import settings
+from core.episode_order import get_order_keys_for_series, get_positions_for_series
 from db import get_db
 from dependencies import get_current_user_or_api_key
 from models.base import MediaType
@@ -33,16 +34,29 @@ from models.collection import Collection
 from models.events import WatchEvent
 from models.media import Media
 from models.show import Show
-from models.users import User
+from models.users import User, UserSettings
 
 router = APIRouter()
 
 CALENDAR_TTL = timedelta(hours=24)
-CALENDAR_SCHEMA = 3
+CALENDAR_SCHEMA = 7
 CALENDAR_WINDOW_DAYS = 14
+CALENDAR_LOOKBACK_DAYS = 7
 FETCH_CONCURRENCY = 8
 
 _computing: set[int] = set()
+
+
+def _server_today() -> date:
+    """Server-configured TZ (same reference used everywhere else that syncs/
+    dates against a single instance-wide clock) - not a per-browser value. A
+    naive UTC boundary would put "today" off by a day near midnight in the
+    server's real timezone."""
+    try:
+        tz = ZoneInfo(settings.tz)
+    except (ZoneInfoNotFoundError, KeyError):
+        tz = ZoneInfo("UTC")
+    return datetime.now(tz).date()
 
 
 async def _candidate_shows(db: AsyncSession, user_id: int) -> list[Show]:
@@ -80,109 +94,215 @@ async def _candidate_shows(db: AsyncSession, user_id: int) -> list[Show]:
             Show.tmdb_id.in_(direct_series_tmdb_ids),
         ))
     )).scalars().all()
-    return [s for s in shows if s.tmdb_id and (s.status or "") not in ("Ended", "Canceled")]
+
+    user_settings_result = await db.execute(select(UserSettings).where(UserSettings.user_id == user_id))
+    user_settings = user_settings_result.scalar_one_or_none()
+    dropped_show_ids = set(user_settings.dropped_shows or []) if user_settings else set()
+
+    return [
+        s for s in shows
+        if (s.tmdb_id or s.tvdb_id) and (s.status or "") not in ("Ended", "Canceled") and s.id not in dropped_show_ids
+    ]
+
+
+def _is_tvdb_show(show: Show) -> bool:
+    """A show whose season/episode numbers are TheTVDB's own (no TMDB
+    counterpart, or explicitly TVDB-canonical) - scheduled from TheTVDB, never
+    TMDB."""
+    return bool(show.tvdb_id) and (show.canonical_source == "tvdb" or not show.tmdb_id)
+
+
+async def _resolve_watch_status(db: AsyncSession, user_id: int, entries: list[dict]) -> None:
+    """Merges live collected/watched flags onto entries in place - local-DB
+    only, no TMDB calls, so it's cheap enough to run on every request
+    (cache hit or not). An episode with no local Media row at all just
+    hasn't been scanned/aired into the library yet, which is the normal
+    case for anything upcoming."""
+    show_ids = {e["show_id"] for e in entries if e.get("show_id") is not None}
+    if not show_ids:
+        for e in entries:
+            e["collected"] = False
+            e["watched"] = False
+        return
+    media_rows = (await db.execute(
+        select(Media.show_id, Media.season_number, Media.episode_number, Media.id)
+        .where(Media.show_id.in_(show_ids), Media.media_type == MediaType.episode)
+    )).all()
+    media_by_key = {(sid, sn, en): mid for sid, sn, en, mid in media_rows}
+    media_ids = list(media_by_key.values())
+    collected_ids: set[int] = set()
+    watched_ids: set[int] = set()
+    if media_ids:
+        collected_ids = {
+            r[0] for r in (await db.execute(
+                select(Collection.media_id).where(Collection.media_id.in_(media_ids), Collection.user_id == user_id)
+            )).all()
+        }
+        watched_ids = {
+            r[0] for r in (await db.execute(
+                select(WatchEvent.media_id).where(
+                    WatchEvent.media_id.in_(media_ids), WatchEvent.user_id == user_id, WatchEvent.completed == True,
+                )
+            )).all()
+        }
+    for e in entries:
+        media_id = media_by_key.get((e.get("show_id"), e["season_number"], e["episode_number"]))
+        e["collected"] = media_id in collected_ids if media_id else False
+        e["watched"] = media_id in watched_ids if media_id else False
 
 
 async def compute_calendar(db: AsyncSession, user_id: int) -> dict:
     from core import tmdb as tmdb_client
+    from core import tvdb as tvdb_client
     from core.translations import get_user_metadata_language
     from routers.media import check_tmdb_key, get_user_tmdb_key
+    from routers.shows import get_user_tvdb_key
 
-    # Server-configured TZ (same as /airing-today, and everything else that
-    # syncs/dates against a single instance-wide clock) - not a per-browser
-    # value. A naive UTC boundary would put "today" off by a day near
-    # midnight in the server's real timezone. Handed back in the payload too,
-    # so the frontend's Today/Yesterday/Tomorrow labels use this same
-    # reference instead of the viewer's own browser clock.
-    try:
-        tz = ZoneInfo(settings.tz)
-    except (ZoneInfoNotFoundError, KeyError):
-        tz = ZoneInfo("UTC")
-    today = datetime.now(tz).date()
+    # Handed back in the payload too, so the frontend's Today/Yesterday/
+    # Tomorrow labels use this same reference instead of the viewer's own
+    # browser clock.
+    today = _server_today()
 
     candidates = await _candidate_shows(db, user_id)
 
     api_key = await get_user_tmdb_key(db, user_id)
-    if not check_tmdb_key(api_key) or not candidates:
+    tvdb_api_key = await get_user_tvdb_key(db, user_id)
+    tmdb_ok = check_tmdb_key(api_key)
+    # Each show is scheduled from the provider it's numbered by; a provider
+    # with no usable key just drops its shows instead of blanking the calendar.
+    candidates = [
+        s for s in candidates
+        if (tvdb_api_key if _is_tvdb_show(s) else (tmdb_ok and s.tmdb_id))
+    ]
+    if not candidates:
         return {
             "schema": CALENDAR_SCHEMA, "generated_at": datetime.utcnow().isoformat(),
             "today": today.isoformat(), "shows_checked": 0, "entries": [],
         }
 
     language = await get_user_metadata_language(db, user_id)
-    window_start = today - timedelta(days=1)
+    window_start = today - timedelta(days=CALENDAR_LOOKBACK_DAYS)
     window_end = today + timedelta(days=CALENDAR_WINDOW_DAYS - 1)
     sem = asyncio.Semaphore(FETCH_CONCURRENCY)
 
-    async def _fetch(show: Show) -> list[dict]:
+    async def _fetch_tvdb(show: Show) -> list[dict]:
         async with sem:
             try:
-                detail = await tmdb_client.get_show_light(show.tmdb_id, api_key=api_key, language=language)
+                raw_eps = await tvdb_client.get_series_episodes(
+                    show.tvdb_id, None, tvdb_api_key, language=tvdb_client.tvdb_language(language)
+                )
             except Exception:
                 return []
-            next_ep = detail.get("next_episode_to_air")
-            season_number = next_ep.get("season_number") if next_ep else None
-            if season_number is None:
-                return []
-            try:
-                season = await tmdb_client.get_season(show.tmdb_id, season_number, api_key=api_key, language=language)
-            except Exception:
-                return []
-
         out = []
-        for ep in season.get("episodes") or []:
-            air_date = ep.get("air_date")
+        for raw in raw_eps:
+            ep = tvdb_client.format_episode(raw)
+            air_date = ep["air_date"]
             if not air_date or not (window_start.isoformat() <= air_date <= window_end.isoformat()):
                 continue
             out.append({
                 "air_date": air_date,
                 "show_id": show.id,
-                "show_tmdb_id": show.tmdb_id,
+                "show_tmdb_id": None,
                 "show_tvdb_id": show.tvdb_id,
                 "show_title": show.title,
                 "poster_path": show.poster_path,
-                "season_number": ep.get("season_number"),
-                "episode_number": ep.get("episode_number"),
-                "episode_name": ep.get("name"),
+                "season_number": ep["season_number"],
+                "episode_number": ep["episode_number"],
+                "episode_name": ep["name"],
             })
+        return out
+
+    async def _fetch(show: Show) -> list[dict]:
+        if _is_tvdb_show(show):
+            return await _fetch_tvdb(show)
+        async with sem:
+            try:
+                detail = await tmdb_client.get_show_light(show.tmdb_id, api_key=api_key, language=language)
+            except Exception:
+                return []
+            season_numbers: set[int] = set()
+            next_ep = detail.get("next_episode_to_air")
+            if next_ep and next_ep.get("season_number") is not None:
+                season_numbers.add(next_ep["season_number"])
+            # Specials (season 0) never surface as next_episode_to_air, so pull
+            # that season explicitly whenever the show has one and scan it for
+            # anything landing in the window too (#333).
+            if any((s or {}).get("season_number") == 0 for s in detail.get("seasons") or []):
+                season_numbers.add(0)
+            if not season_numbers:
+                return []
+            seasons: list[dict] = []
+            for sn in season_numbers:
+                try:
+                    seasons.append(await tmdb_client.get_season(show.tmdb_id, sn, api_key=api_key, language=language))
+                except Exception:
+                    continue
+
+        out = []
+        for season in seasons:
+            for ep in season.get("episodes") or []:
+                air_date = ep.get("air_date")
+                if not air_date or not (window_start.isoformat() <= air_date <= window_end.isoformat()):
+                    continue
+                out.append({
+                    "air_date": air_date,
+                    "show_id": show.id,
+                    "show_tmdb_id": show.tmdb_id,
+                    "show_tvdb_id": show.tvdb_id,
+                    # detail was already fetched with language=language above -
+                    # its name is the localized one for free, unlike the raw
+                    # stored show.title (#404 follow-up: this endpoint already
+                    # requested translated episode/season data but still
+                    # stamped the untranslated show name on every entry).
+                    "show_title": detail.get("name") or show.title,
+                    "poster_path": show.poster_path,
+                    "season_number": ep.get("season_number"),
+                    "episode_number": ep.get("episode_number"),
+                    "episode_name": ep.get("name"),
+                })
         return out
 
     fetched = await asyncio.gather(*(_fetch(s) for s in candidates))
     entries = [e for group in fetched for e in group]
 
-    # Batch-resolve collected/watched status against local Media rows - an
-    # episode with no local row at all just hasn't been scanned/aired into
-    # the library yet, which is the normal case for anything upcoming.
-    show_ids = {e["show_id"] for e in entries}
-    if show_ids:
-        media_rows = (await db.execute(
-            select(Media.show_id, Media.season_number, Media.episode_number, Media.id)
-            .where(Media.show_id.in_(show_ids), Media.media_type == MediaType.episode)
-        )).all()
-        media_by_key = {(sid, sn, en): mid for sid, sn, en, mid in media_rows}
-        media_ids = list(media_by_key.values())
-        collected_ids: set[int] = set()
-        watched_ids: set[int] = set()
-        if media_ids:
-            collected_ids = {
-                r[0] for r in (await db.execute(
-                    select(Collection.media_id).where(Collection.media_id.in_(media_ids), Collection.user_id == user_id)
-                )).all()
-            }
-            watched_ids = {
-                r[0] for r in (await db.execute(
-                    select(WatchEvent.media_id).where(
-                        WatchEvent.media_id.in_(media_ids), WatchEvent.user_id == user_id, WatchEvent.completed == True,
-                    )
-                )).all()
-            }
-        for e in entries:
-            media_id = media_by_key.get((e["show_id"], e["season_number"], e["episode_number"]))
-            e["collected"] = media_id in collected_ids if media_id else False
-            e["watched"] = media_id in watched_ids if media_id else False
-            del e["show_id"]
+    # collected/watched are deliberately NOT resolved here - this payload
+    # (specifically the TMDB-derived schedule) is what gets cached, and
+    # those two flags change far more often than the schedule does. They're
+    # merged in fresh, from local DB queries only, every time a payload is
+    # served - see _resolve_watch_status - so marking something watched/
+    # collected shows up on the calendar immediately instead of waiting for
+    # the next full recompute (up to 24h later). show_id stays on each entry
+    # (never sent to the frontend, which only reads show_tmdb_id/
+    # show_tvdb_id) so that resolution can happen against a cached payload
+    # too, not just a freshly computed one.
 
-    entries.sort(key=lambda e: (e["air_date"], e["show_title"] or ""))
+    # #174: render each entry in the ordering the user picked for that show.
+    order_keys = await get_order_keys_for_series(
+        db, user_id, list({e["show_tmdb_id"] for e in entries if e.get("show_tmdb_id")})
+    )
+    if order_keys:
+        by_pair = await get_positions_for_series(
+            db, [(sid, key) for sid, key in order_keys.items()]
+        )
+        flat: dict[tuple[int, int, int], object] = {}
+        for (sid, _key), canon_map in by_pair.items():
+            for (cs, ce), pos in canon_map.items():
+                flat[(sid, cs, ce)] = pos
+        for e in entries:
+            key = order_keys.get(e.get("show_tmdb_id"))
+            if not key:
+                continue
+            e["show_episode_order"] = key
+            pos = flat.get((e["show_tmdb_id"], e["season_number"], e["episode_number"]))
+            if pos:
+                e["display_season_number"] = pos.display_season
+                e["display_episode_number"] = pos.display_episode
+
+    entries.sort(key=lambda e: (
+        e["air_date"], e["show_title"] or "",
+        e["season_number"] if e["season_number"] is not None else 0,
+        e["episode_number"] if e["episode_number"] is not None else 0,
+    ))
     return {
         "schema": CALENDAR_SCHEMA,
         "generated_at": datetime.utcnow().isoformat(),
@@ -192,15 +312,44 @@ async def compute_calendar(db: AsyncSession, user_id: int) -> dict:
     }
 
 
+def _is_cache_fresh(row: UserCalendarCache | None) -> bool:
+    if not row or (datetime.utcnow() - row.computed_at) >= CALENDAR_TTL:
+        return False
+    payload = row.payload or {}
+    if payload.get("schema") != CALENDAR_SCHEMA:
+        return False
+    # A cache built before local midnight is stale the instant the calendar
+    # day rolls over, even if it's still within the raw TTL - 24h is a
+    # rolling duration, not a "still the same calendar day" guarantee, so a
+    # payload computed at 17:20 yesterday would otherwise still read as
+    # fresh this morning with every Today/Yesterday/Tomorrow label (and the
+    # airing-today widget's "today" filter) pointing at yesterday.
+    return payload.get("today") == _server_today().isoformat()
+
+
+def _is_cache_usable(
+    row: UserCalendarCache | None, max_age: timedelta = timedelta(hours=48)
+) -> bool:
+    """A cache row good enough to show immediately even when _is_cache_fresh
+    rejected it for the calendar-day rollover.
+
+    Any payload computed in the last couple of days still has a 14-day forward
+    window that covers today, so the airing-today widget can serve it right
+    away and recompute in the background instead of blocking its first load
+    after local midnight on a full TMDB fan-out (#194). Deliberately ignores
+    the day-match and the 24h TTL - staleness within max_age is the point.
+    """
+    if not row or (datetime.utcnow() - row.computed_at) >= max_age:
+        return False
+    return (row.payload or {}).get("schema") == CALENDAR_SCHEMA
+
+
 async def _load_or_compute(db: AsyncSession, user_id: int, force: bool) -> dict:
     row = (
         await db.execute(select(UserCalendarCache).where(UserCalendarCache.user_id == user_id))
     ).scalars().first()
-    if (
-        row and not force
-        and (datetime.utcnow() - row.computed_at) < CALENDAR_TTL
-        and (row.payload or {}).get("schema") == CALENDAR_SCHEMA
-    ):
+    if not force and _is_cache_fresh(row):
+        await _resolve_watch_status(db, user_id, row.payload.get("entries", []))
         return {"computed_at": row.computed_at.isoformat(), "cached": True, "calendar": row.payload}
     payload = await compute_calendar(db, user_id)
     if row:
@@ -210,6 +359,7 @@ async def _load_or_compute(db: AsyncSession, user_id: int, force: bool) -> dict:
         row = UserCalendarCache(user_id=user_id, payload=payload, computed_at=datetime.utcnow())
         db.add(row)
     await db.commit()
+    await _resolve_watch_status(db, user_id, payload.get("entries", []))
     return {"computed_at": row.computed_at.isoformat(), "cached": False, "calendar": payload}
 
 
@@ -240,11 +390,18 @@ async def get_calendar(
         row = (
             await db.execute(select(UserCalendarCache).where(UserCalendarCache.user_id == current_user.id))
         ).scalars().first()
-        if (
-            row
-            and (datetime.utcnow() - row.computed_at) < CALENDAR_TTL
-            and (row.payload or {}).get("schema") == CALENDAR_SCHEMA
-        ):
+        fresh = _is_cache_fresh(row)
+        # A same-day-stale but still-usable cache (see _is_cache_usable) is
+        # served immediately too, not just an exact-day match - the schedule
+        # itself rarely changes day to day, and collected/watched are always
+        # resolved live below regardless of how old the cached schedule is.
+        # Matches the airing-today widget's own fallback (#194) so the
+        # calendar page stops blocking page load on a full TMDB recompute
+        # for anything short of a truly cold cache.
+        if fresh or _is_cache_usable(row):
+            await _resolve_watch_status(db, current_user.id, row.payload.get("entries", []))
+            if not fresh:
+                asyncio.create_task(_background_compute(current_user.id))
             return {"computed_at": row.computed_at.isoformat(), "cached": True, "calendar": row.payload}
         asyncio.create_task(_background_compute(current_user.id))
         return {"computed_at": None, "cached": False, "calendar": {"entries": []}}

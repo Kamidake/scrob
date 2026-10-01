@@ -35,15 +35,23 @@ router = APIRouter()
 
 @router.get("/public-access-status")
 async def get_public_access_status(db: AsyncSession = Depends(get_db)):
-    """Unauthenticated: whether the admin allows anonymous browsing/viewing.
-    Read by the frontend's auth middleware to decide whether an anonymous
-    request to a gated page should be let through."""
+    """Unauthenticated: global feature flags every page render needs to know
+    about, regardless of login state. Originally just anon-nav access status
+    (read by the frontend's auth middleware to decide whether an anonymous
+    request to a gated page should be let through) - now also carries other
+    admin toggles like disable_comments (#301) that hide UI for every
+    visitor, not just anonymous ones."""
     result = await db.execute(select(GlobalSettings).where(GlobalSettings.id == 1))
     gs = result.scalar_one_or_none()
     return {
         # Requires a global TMDB key even if the toggle is on, in case the key
         # was removed after the admin enabled it.
         "enable_logged_out_navigation": bool(gs and gs.enable_logged_out_navigation and gs.tmdb_api_key),
+        "disable_comments": bool(gs and gs.disable_comments),
+        # Lets an anonymous visitor's search page offer the TVDB fallback
+        # search too, the same as a logged-in user with an effective key -
+        # there's no per-anon-visitor UserSettings override to also check.
+        "has_global_tvdb_key": bool(gs and gs.tvdb_api_key),
     }
 
 
@@ -752,8 +760,9 @@ async def get_public_profile(
     comments_list = recent_comments_q.scalars().all()
 
     # Batch resolve titles for comments
-    show_tmdb_ids = list({c.tmdb_id for c in comments_list if c.media_type in ("series", "season", "episode")})
-    movie_tmdb_ids = list({c.tmdb_id for c in comments_list if c.media_type == "movie"})
+    show_tmdb_ids = list({c.tmdb_id for c in comments_list if c.media_type in ("series", "season", "episode") and c.tmdb_id})
+    show_tvdb_ids = list({c.tvdb_id for c in comments_list if c.media_type in ("series", "season", "episode") and c.tvdb_id})
+    movie_tmdb_ids = list({c.tmdb_id for c in comments_list if c.media_type == "movie" and c.tmdb_id})
 
     show_titles: dict[int, tuple[str, str | None]] = {}
     movie_titles: dict[int, tuple[str, str | None]] = {}
@@ -765,6 +774,15 @@ async def get_public_profile(
         )
         for tmdb_id, title, poster_path in sq.all():
             show_titles[tmdb_id] = (title, poster_path)
+
+    show_tvdb_titles: dict[int, tuple[str, str | None]] = {}
+    if show_tvdb_ids:
+        tq = await db.execute(
+            select(ShowModel.tvdb_id, ShowModel.title, ShowModel.poster_path)
+            .where(ShowModel.tvdb_id.in_(show_tvdb_ids))
+        )
+        for tvdb_id, title, poster_path in tq.all():
+            show_tvdb_titles[tvdb_id] = (title, poster_path)
 
     if movie_tmdb_ids:
         mq = await db.execute(
@@ -778,7 +796,7 @@ async def get_public_profile(
     recent_comments = []
     for c in comments_list:
         if c.media_type in ("series", "season", "episode"):
-            info = show_titles.get(c.tmdb_id)
+            info = show_titles.get(c.tmdb_id) if c.tmdb_id else show_tvdb_titles.get(c.tvdb_id)
         else:
             info = movie_titles.get(c.tmdb_id)
         recent_comments.append({
@@ -786,6 +804,7 @@ async def get_public_profile(
             "content": c.content,
             "media_type": c.media_type,
             "tmdb_id": c.tmdb_id,
+            "tvdb_id": c.tvdb_id,
             "season_number": c.season_number,
             "episode_number": c.episode_number,
             "title": info[0] if info else None,

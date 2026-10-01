@@ -1,16 +1,20 @@
 ---
 import Base from "../layouts/Base.astro";
 import { api } from "../lib/api";
+import type { DeviceGrant } from "../lib/api";
 import { connectionIconHtml } from "../lib/connectionIcons";
 
 const { token } = Astro.locals;
-const [settings, me, connections, scrobbleConnections, seasonOverrides] = await Promise.all([
+const [settings, me, connections, scrobbleConnections, seasonOverrides, deviceGrants] = await Promise.all([
   api.auth.getSettings(token!),
   api.auth.me(token!),
   api.auth.getConnections(token!),
   api.auth.getScrobbleConnections(token!),
   api.sync.getSeasonOverrides(token!).catch(() => []),
+  api.auth.deviceGrants(token!).catch(() => [] as DeviceGrant[]),
 ]);
+const fmtGrantDate = (v: string | null) =>
+  v ? new Date(v.endsWith("Z") ? v : v + "Z").toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "—";
 const hasTmdbKey = settings.has_effective_tmdb_key;
 const AUTO_SYNC_INTERVAL_OPTIONS = [
   { value: 0.25, label: "Every 15m" },
@@ -264,7 +268,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                           </div>
                         )}
                       </div>
-                      {conn.type === "plex" && (
+                      {conn.type === "plex" && me.is_admin && (
                         <div class="bg-zinc-950 rounded-xl p-4 space-y-3">
                           <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Watchlist → Radarr / Sonarr</p>
                           <p class="text-xs text-zinc-500">Automatically request items added to your Plex watchlist. Requires Radarr / Sonarr to be configured in settings.</p>
@@ -335,6 +339,23 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                         <option value="arvio">ARVIO</option>
                         <option value="stremio">Stremio</option>
                       </select>
+                    </div>
+                    <div id="new-plex-login-row" class="hidden rounded-xl border border-amber-500/20 bg-amber-500/5 p-4 space-y-3">
+                      <p class="text-sm text-zinc-300">Sign in with Plex to fill in the server URL and token automatically.</p>
+                      <button type="button" id="plex-login-btn" class="text-sm bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg transition-colors cursor-pointer">Login with Plex</button>
+                      <div id="plex-login-server-wrap" class="hidden space-y-2">
+                        <label for="plex-login-server" class="block text-sm font-medium text-zinc-400">Server</label>
+                        <select id="plex-login-server" class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500 transition-all cursor-pointer"></select>
+                      </div>
+                      <div id="plex-login-connection-wrap" class="hidden space-y-2">
+                        <label for="plex-login-connection" class="block text-sm font-medium text-zinc-400">Connection</label>
+                        <select id="plex-login-connection" class="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-amber-500 transition-all cursor-pointer"></select>
+                        <p class="text-xs text-zinc-500">Pick the address Scrob should use to reach this server. Reachable ones are marked; you can also edit the URL field directly.</p>
+                      </div>
+                      <p id="plex-login-status" class="text-xs text-zinc-500 hidden"></p>
+                      <input type="hidden" id="new-plex-auth-token" />
+                      <input type="hidden" id="new-plex-account-id" />
+                      <input type="hidden" id="new-plex-machine-id" />
                     </div>
                     <div id="new-conn-url-row" class="space-y-2">
                       <label id="new-conn-url-label" for="new-conn-url" class="block text-sm font-medium text-zinc-400">Server URL</label>
@@ -719,6 +740,10 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                             </label>
                           </div>
                         </div>
+                        <label class="flex items-center gap-3 cursor-pointer group">
+                          <input type="checkbox" name="trakt_sync_dropped" id="trakt_sync_dropped" checked={settings.trakt_sync_dropped !== false} class="sync-pref-checkbox w-4 h-4 rounded accent-red-500 cursor-pointer" />
+                          <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">Dropped shows</span>
+                        </label>
                         <div class="flex flex-wrap gap-2">
                           <button
                             type="button"
@@ -745,6 +770,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                           { key: "trakt_push_ratings", label: "Ratings" },
                           { key: "trakt_push_collection", label: "Collection" },
                           { key: "trakt_push_lists", label: "Lists" },
+                          { key: "trakt_push_dropped", label: "Dropped shows" },
                         ].map(({ key, label }) => (
                           <label class="flex items-center gap-3 cursor-pointer group">
                             <input type="checkbox" name={key} id={key} checked={!!settings[key as keyof typeof settings]} class="sync-pref-checkbox w-4 h-4 rounded accent-red-500 cursor-pointer" />
@@ -753,9 +779,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                         ))}
                         <label class="flex items-center gap-3 cursor-pointer group">
                           <input type="checkbox" name="trakt_scrobble" id="trakt_scrobble" checked={!!settings.trakt_scrobble} class="sync-pref-checkbox w-4 h-4 rounded accent-red-500 cursor-pointer" />
-                          <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">
-                            Now watching <span class="text-zinc-500 text-xs">(live scrobble on play/pause/stop)</span>
-                          </span>
+                          <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">Now watching</span>
                         </label>
                         <button
                           type="button"
@@ -786,6 +810,16 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                             ))}
                           </select>
                         </div>
+                      </div>
+                    )}
+                    {settings.trakt_connected && (
+                      <div class="bg-zinc-950 rounded-xl p-4 space-y-3">
+                        <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Comments</p>
+                        <label class="flex items-center gap-3 cursor-pointer group">
+                          <input type="checkbox" name="trakt_show_comments" id="trakt_show_comments" checked={!!settings.trakt_show_comments} class="sync-pref-checkbox w-4 h-4 rounded accent-red-500 cursor-pointer" />
+                          <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">Community Comments</span>
+                        </label>
+                        <p class="text-xs text-zinc-500">Show Trakt's public comments (not your own) on movie, show, season, and episode pages.</p>
                       </div>
                     )}
                   </div>
@@ -939,6 +973,134 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
               </div>
             </div>
 
+            <!-- WeTrakr collapsible row -->
+            <div class="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
+              <div class="collapsible-header flex items-center justify-between px-6 py-4 hover:bg-zinc-900/40 cursor-pointer transition-colors select-none" data-target="wetrakr-body">
+                <div class="flex items-center gap-4 pointer-events-none">
+                  <Fragment set:html={connectionIconHtml("wetrakr")} />
+                  <div class="flex flex-col gap-0.5">
+                    <span class="font-medium text-zinc-200">WeTrakr</span>
+                    <span id="wetrakr-conn-status" class="hidden text-xs font-normal px-1.5 py-0.5 rounded self-start pointer-events-auto"></span>
+                  </div>
+                </div>
+                <div class="flex items-center gap-2">
+                  <div class="flex gap-2" onclick="event.stopPropagation()">
+                    {settings.wetrakr_connected ? (
+                      <button type="button" id="wetrakr-disconnect-btn" class="js-action-btn text-sm bg-zinc-800 hover:bg-red-900/30 text-red-400 border border-zinc-700 hover:border-red-700 px-3 py-1.5 rounded-lg transition-colors cursor-pointer">Disconnect</button>
+                    ) : (
+                      <button type="button" id="wetrakr-connect-btn" class="text-sm bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 border border-sky-500/30 px-3 py-1.5 rounded-lg transition-colors cursor-pointer">Connect WeTrakr</button>
+                    )}
+                  </div>
+                  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="collapsible-chevron w-4 h-4 text-zinc-500 transition-transform pointer-events-none ml-1 shrink-0">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
+                  </svg>
+                </div>
+              </div>
+              <div id="wetrakr-progress" class="hidden border-t border-zinc-800 px-6 py-3">
+                <div class="flex justify-between items-center mb-1.5">
+                  <span id="wetrakr-job-label" class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Working…</span>
+                  <div class="flex items-center gap-3">
+                    <span id="wetrakr-job-pct" class="text-xs font-bold text-zinc-400"></span>
+                    <button type="button" id="wetrakr-job-cancel" class="hidden cursor-pointer text-xs font-semibold text-zinc-400 hover:text-red-400 border border-zinc-700 hover:border-red-500/50 px-2 py-0.5 rounded-md transition-colors">Cancel</button>
+                  </div>
+                </div>
+                <div class="w-full bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+                  <div id="wetrakr-job-bar" class="h-1.5 rounded-full transition-all duration-500 bg-sky-500 animate-pulse" style="width: 100%"></div>
+                </div>
+                <div class="flex justify-between text-xs text-zinc-500 mt-1">
+                  <span id="wetrakr-job-items"></span>
+                  <span id="wetrakr-job-status"></span>
+                </div>
+              </div>
+              <div id="wetrakr-body" class="border-t border-zinc-800 hidden">
+                <div class="grid md:grid-cols-2 gap-8 px-6 py-6">
+                  <!-- Left: Auth / Info -->
+                  <div class="space-y-4">
+                    <div id="wetrakr-auth-panel" class="hidden space-y-3 bg-zinc-900/50 border border-zinc-700 rounded-xl p-4">
+                      <p class="text-sm text-zinc-400">Go to <strong id="wetrakr-verify-url" class="text-zinc-100"></strong> and enter this code:</p>
+                      <div class="font-mono text-2xl font-bold tracking-widest text-zinc-100 bg-zinc-950 border border-zinc-700 rounded-lg px-4 py-3 text-center select-all" id="wetrakr-user-code"></div>
+                      <p class="text-xs text-zinc-500" id="wetrakr-auth-status">Waiting for authorization…</p>
+                    </div>
+                    <p class="text-sm text-zinc-400">
+                      {settings.wetrakr_connected
+                        ? "WeTrakr is connected. Use Pull to import your watched history and ratings."
+                        : "Click Connect WeTrakr to link your account — no app registration needed."}
+                    </p>
+                  </div>
+                  <!-- Right: Sync Preferences (only if connected) -->
+                  {settings.wetrakr_connected && (
+                    <div class="space-y-4">
+                      <div class="bg-zinc-950 rounded-xl p-4 space-y-3">
+                        <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">WeTrakr → Scrob</p>
+                        {[
+                          { key: "wetrakr_sync_watched", label: "Watched history" },
+                          { key: "wetrakr_sync_ratings", label: "Ratings" },
+                          { key: "wetrakr_sync_lists", label: "Lists" },
+                          { key: "wetrakr_sync_comments", label: "Comments" },
+                        ].map(({ key, label }) => (
+                          <label class="flex items-center gap-3 cursor-pointer group">
+                            <input type="checkbox" name={key} id={key} checked={settings[key as keyof typeof settings] !== false} class="sync-pref-checkbox w-4 h-4 rounded accent-sky-500 cursor-pointer" />
+                            <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">{label}</span>
+                          </label>
+                        ))}
+                        <button
+                          type="button"
+                          data-action="sync_wetrakr"
+                          disabled={!hasTmdbKey}
+                          title={!hasTmdbKey ? "TMDB Read Access Token is required for sync" : "Pull watched history and ratings from WeTrakr"}
+                          class={`js-action-btn text-sm px-3 py-1.5 rounded-lg transition-colors cursor-pointer disabled:opacity-50 ${hasTmdbKey ? "bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 border border-sky-500/30" : "bg-zinc-800 text-zinc-400 border border-zinc-700 opacity-50"}`}
+                        >Pull</button>
+                      </div>
+                      <div class="bg-zinc-950 rounded-xl p-4 space-y-3">
+                        <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Scrob → WeTrakr</p>
+                        {[
+                          { key: "wetrakr_push_watched", label: "Watched status" },
+                          { key: "wetrakr_push_ratings", label: "Ratings" },
+                          { key: "wetrakr_push_lists", label: "Lists" },
+                          { key: "wetrakr_push_comments", label: "Comments" },
+                        ].map(({ key, label }) => (
+                          <label class="flex items-center gap-3 cursor-pointer group">
+                            <input type="checkbox" name={key} id={key} checked={!!settings[key as keyof typeof settings]} class="sync-pref-checkbox w-4 h-4 rounded accent-sky-500 cursor-pointer" />
+                            <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">{label}</span>
+                          </label>
+                        ))}
+                        <button
+                          type="button"
+                          data-action="push_wetrakr"
+                          class="js-action-btn text-sm bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 border border-sky-500/30 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+                          title="Push all watched states, ratings, lists and comments from Scrob to WeTrakr"
+                        >Push</button>
+                      </div>
+                      <div class="bg-zinc-950 rounded-xl p-4 space-y-3">
+                        <p class="text-xs font-semibold uppercase tracking-wide text-zinc-500">Auto Sync</p>
+                        <div class="flex items-center justify-between gap-4">
+                          <label class="text-sm text-zinc-300">Pull interval</label>
+                          <select name="wetrakr_auto_sync_interval" class="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-sky-500 transition-all cursor-pointer">
+                            <option value="" selected={!settings.wetrakr_auto_sync_interval}>Disabled</option>
+                            {AUTO_SYNC_INTERVAL_OPTIONS.map(({ value, label }) => (
+                              <option value={String(value)} selected={settings.wetrakr_auto_sync_interval === value}>{label}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div class="flex items-center justify-between gap-4">
+                          <label class="text-sm text-zinc-300">Push interval</label>
+                          <select name="wetrakr_auto_push_interval" class="bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-sky-500 transition-all cursor-pointer">
+                            <option value="" selected={!settings.wetrakr_auto_push_interval}>Disabled</option>
+                            {AUTO_SYNC_INTERVAL_OPTIONS.map(({ value, label }) => (
+                              <option value={String(value)} selected={settings.wetrakr_auto_push_interval === value}>{label}</option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+                <div class="border-t border-zinc-800 px-6 py-4 flex gap-2">
+                  <button type="button" data-action="save_wetrakr_settings" class="js-action-btn text-sm bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition-colors cursor-pointer">Save changes</button>
+                </div>
+              </div>
+            </div>
+
             <!-- MDBList collapsible row -->
             <div class="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
               <div class="collapsible-header flex items-center justify-between px-6 py-4 hover:bg-zinc-900/40 cursor-pointer transition-colors select-none" data-target="mdblist-body">
@@ -1012,6 +1174,10 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                             <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">{label}</span>
                           </label>
                         ))}
+                        <label class="flex items-center gap-3 cursor-pointer group">
+                          <input type="checkbox" name="mdblist_sync_dropped" id="mdblist_sync_dropped" checked={settings.mdblist_sync_dropped !== false} class="sync-pref-checkbox w-4 h-4 rounded accent-violet-500 cursor-pointer" />
+                          <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">Dropped shows</span>
+                        </label>
                         <button
                           type="button"
                           data-action="sync_mdblist"
@@ -1029,6 +1195,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                           { key: "mdblist_push_ratings", label: "Ratings" },
                           { key: "mdblist_push_watchlist", label: "Watchlist" },
                           { key: "mdblist_push_collection", label: "Collection" },
+                          { key: "mdblist_push_dropped", label: "Dropped shows" },
                         ].map(({ key, label }) => (
                           <label class="flex items-center gap-3 cursor-pointer group">
                             <input type="checkbox" name={key} id={key} checked={!!settings[key as keyof typeof settings]} class="sync-pref-checkbox w-4 h-4 rounded accent-violet-500 cursor-pointer" />
@@ -1037,9 +1204,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                         ))}
                         <label class="flex items-center gap-3 cursor-pointer group">
                           <input type="checkbox" name="mdblist_scrobble" id="mdblist_scrobble" checked={!!settings.mdblist_scrobble} class="sync-pref-checkbox w-4 h-4 rounded accent-violet-500 cursor-pointer" />
-                          <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">
-                            Now watching <span class="text-zinc-500 text-xs">(live scrobble on play/pause/stop)</span>
-                          </span>
+                          <span class="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">Now watching</span>
                         </label>
                         <button
                           type="button"
@@ -1366,6 +1531,42 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
         </form>
       </section>
 
+      <!-- Connected Apps -->
+      <section>
+        <h2 class="section-headline mb-4 border-b border-zinc-800 pb-2">Connected Apps</h2>
+        <div class="space-y-4 max-w-xl">
+          <p class="text-sm text-zinc-400">
+            Apps and devices you've linked with a one-time code (for example the Umbrella Kodi add-on). Each holds a
+            write-scoped token — it can change your watch history, ratings and lists, but not your password, email or
+            security settings. Revoking takes effect immediately.
+          </p>
+          <ul id="device-grants-list" class="space-y-2">
+            {deviceGrants.length === 0 && (
+              <li class="text-sm text-zinc-500 border border-zinc-800 rounded-lg px-4 py-3">No connected apps.</li>
+            )}
+            {deviceGrants.map((g) => (
+              <li
+                data-grant-id={g.id}
+                class="flex items-center justify-between gap-4 border border-zinc-800 rounded-lg px-4 py-3"
+              >
+                <div class="min-w-0">
+                  <p class="font-semibold text-zinc-100 truncate">{g.client_name}</p>
+                  <p class="text-xs text-zinc-500 mt-0.5">
+                    Linked {fmtGrantDate(g.approved_at ?? g.created_at)} · Last used {fmtGrantDate(g.last_seen_at)} · Scope: {g.scope}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  class="revoke-grant-btn shrink-0 text-sm font-semibold text-rose-400 hover:text-rose-300 border border-rose-500/30 hover:border-rose-500/60 rounded-lg px-3 py-1.5 transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  Revoke
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </section>
+
       <!-- Import -->
       <section>
         <h2 class="section-headline mb-4 border-b border-zinc-800 pb-2">Import</h2>
@@ -1686,7 +1887,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
             <input type="text" id="remap-search-input" placeholder="Show title…" class="flex-1 bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2.5 text-zinc-100 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all" />
             <button type="button" id="remap-search-btn" class="px-4 py-2.5 bg-zinc-700 hover:bg-zinc-600 text-zinc-100 text-sm font-medium rounded-lg transition-colors cursor-pointer shrink-0">Search</button>
           </div>
-          <div id="remap-search-results" class="mt-2 space-y-1 max-h-48 overflow-y-auto"></div>
+          <div id="remap-search-results" class="mt-2 space-y-1 max-h-48 overflow-y-auto scrollbar-hidden"></div>
         </div>
         <!-- TVDB title search (match mode) -->
         <div id="remap-tvdb-section" class="hidden">
@@ -1695,7 +1896,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
             <input type="text" id="remap-tvdb-input" placeholder="Show title…" class="flex-1 bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2.5 text-zinc-100 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all" />
             <button type="button" id="remap-tvdb-search-btn" class="px-4 py-2.5 bg-zinc-700 hover:bg-zinc-600 text-zinc-100 text-sm font-medium rounded-lg transition-colors cursor-pointer shrink-0">Search</button>
           </div>
-          <div id="remap-tvdb-results" class="mt-2 space-y-1 max-h-48 overflow-y-auto"></div>
+          <div id="remap-tvdb-results" class="mt-2 space-y-1 max-h-48 overflow-y-auto scrollbar-hidden"></div>
         </div>
         <!-- Selected show + season input -->
         <div id="remap-selected-area" class="hidden">
@@ -1733,11 +1934,13 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
   }
 
   // Keeps the toast below the nav (so it never covers it or the account
-  // dropdown) while still sitting near the top once the nav scrolls away.
+  // dropdown) while still sitting near the top once the nav scrolls away -
+  // floored by the iOS safe-area inset (notch/status bar), not just a flat
+  // 16px, or it renders underneath it once the nav is out of view (#402).
   function positionMessage(msg: HTMLElement) {
     const nav = document.querySelector('nav');
     const navBottom = nav ? nav.getBoundingClientRect().bottom : 0;
-    msg.style.top = `${Math.max(16, navBottom + 12)}px`;
+    msg.style.top = `max(16px, calc(env(safe-area-inset-top, 0px) + 8px), ${navBottom + 12}px)`;
   }
 
   function showMessage(text, type = 'success', opts: { scroll?: boolean } = {}) {
@@ -1839,9 +2042,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       bar.className = `h-1.5 rounded-full transition-all duration-500 ${barColor}${isPending || job.total_items === 0 ? ' animate-pulse' : ''}`;
       bar.style.width = isPending || job.total_items === 0 ? '100%' : `${pct}%`;
     }
-    if (label) label.textContent = isPush
-      ? (isPending ? 'Push queued…' : 'Pushing…')
-      : (isPending ? 'Pull queued…' : 'Pulling…');
+    if (label) label.textContent = isPending
+      ? (isPush ? 'Push queued…' : 'Pull queued…')
+      : (job.current_step || (isPush ? 'Pushing…' : 'Pulling…'));
     if (pctEl) pctEl.textContent = job.total_items > 0 ? `${pct}%` : '';
     if (items) items.textContent = job.total_items > 0
       ? `${job.processed_items} / ${job.total_items} items`
@@ -1945,7 +2148,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       bar.className = `h-1.5 rounded-full transition-all duration-500 ${barColor}${indeterminate ? ' animate-pulse' : ''}`;
       bar.style.width = indeterminate ? '100%' : `${pct}%`;
     }
-    if (label) label.textContent = isPush ? (isPending ? 'Push queued…' : 'Pushing…') : (isPending ? 'Pull queued…' : 'Pulling…');
+    if (label) label.textContent = isPending
+      ? (isPush ? 'Push queued…' : 'Pull queued…')
+      : (job.current_step || (isPush ? 'Pushing…' : 'Pulling…'));
     if (pctEl) pctEl.textContent = pct > 0 ? `${pct}%` : '';
     if (items) items.textContent = job.total_items > 0 ? `${job.processed_items} / ${job.total_items} items` : 'Loading…';
   }
@@ -1975,6 +2180,89 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
   function startSimklPoller() {
     if (simklPoller != null) clearTimeout(simklPoller);
     pollSimklJob();
+  }
+
+  let wetrakrPoller: ReturnType<typeof setTimeout> | null = null;
+
+  function renderWetrakrProgress(job: any) {
+    const strip  = document.getElementById('wetrakr-progress');
+    const bar    = document.getElementById('wetrakr-job-bar');
+    const pctEl  = document.getElementById('wetrakr-job-pct');
+    const label  = document.getElementById('wetrakr-job-label');
+    const items  = document.getElementById('wetrakr-job-items');
+    const cancelBtn = document.getElementById('wetrakr-job-cancel') as HTMLButtonElement | null;
+    if (!strip) return;
+
+    if (!job) { strip.classList.add('hidden'); return; }
+    strip.classList.remove('hidden');
+
+    const isPush     = job.job_type === 'push';
+    const isFailed   = job.status === 'failed';
+    const isCancelled = job.status === 'cancelled';
+    const isCompleted = job.status === 'completed';
+    const isPending  = job.status === 'pending';
+
+    if (isFailed || isCancelled) {
+      if (cancelBtn) cancelBtn.classList.add('hidden');
+      if (bar) { bar.className = 'h-1.5 rounded-full transition-all duration-500 bg-red-500'; bar.style.width = '100%'; }
+      if (label) label.textContent = isCancelled ? (isPush ? 'Push cancelled' : 'Pull cancelled') : (isPush ? 'Push failed' : 'Pull failed');
+      if (pctEl) pctEl.textContent = '';
+      if (items) items.textContent = isCancelled ? '' : esc(job.error_message || 'Unknown error');
+      return;
+    }
+
+    if (isCompleted) {
+      if (cancelBtn) cancelBtn.classList.add('hidden');
+      if (bar) { bar.className = `h-1.5 rounded-full transition-all duration-500 ${isPush ? 'bg-amber-500' : 'bg-sky-500'}`; bar.style.width = '100%'; }
+      if (label) label.textContent = isPush ? 'Push complete' : 'Pull complete';
+      if (pctEl) pctEl.textContent = '100%';
+      const s = job.stats;
+      if (items) items.textContent = s
+        ? `${s.movies ?? 0} movies, ${s.episodes ?? 0} episodes, ${s.ratings ?? 0} ratings`
+        : `${job.processed_items} items`;
+      return;
+    }
+
+    wireCancelButton(cancelBtn, job);
+    const pct = job.total_items > 0 ? Math.min(100, Math.round((job.processed_items / job.total_items) * 100)) : 0;
+    const barColor = isPush ? 'bg-amber-500' : 'bg-sky-500';
+    const indeterminate = isPending || pct === 0;
+    if (bar) {
+      bar.className = `h-1.5 rounded-full transition-all duration-500 ${barColor}${indeterminate ? ' animate-pulse' : ''}`;
+      bar.style.width = indeterminate ? '100%' : `${pct}%`;
+    }
+    if (label) label.textContent = isPending
+      ? (isPush ? 'Push queued…' : 'Pull queued…')
+      : (job.current_step || (isPush ? 'Pushing…' : 'Pulling…'));
+    if (pctEl) pctEl.textContent = pct > 0 ? `${pct}%` : '';
+    if (items) items.textContent = job.total_items > 0 ? `${job.processed_items} / ${job.total_items} items` : 'Loading…';
+  }
+
+  async function pollWetrakrJob() {
+    try {
+      const res = await fetch('/api/proxy/sync/status', { headers: { 'Authorization': `Bearer ${token}` } });
+      if (!res.ok) return;
+      const jobs: any[] = await res.json();
+      const job = jobs.find(j => j.source === 'wetrakr');
+      const isActive = job && (job.status === 'pending' || job.status === 'running');
+      const isRecentDone = job && (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled')
+        && new Date(job.updated_at).getTime() > Date.now() - 8000;
+      renderWetrakrProgress((isActive || isRecentDone) ? job : null);
+      if (isActive) {
+        wetrakrPoller = setTimeout(pollWetrakrJob, 2000);
+      } else if (isRecentDone) {
+        wetrakrPoller = setTimeout(() => { renderWetrakrProgress(null); wetrakrPoller = null; }, 4000);
+      } else {
+        wetrakrPoller = null;
+      }
+    } catch {
+      wetrakrPoller = null;
+    }
+  }
+
+  function startWetrakrPoller() {
+    if (wetrakrPoller != null) clearTimeout(wetrakrPoller);
+    pollWetrakrJob();
   }
 
   // ── Trakt progress tracking ───────────────────────────────────────────────
@@ -2032,7 +2320,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       bar.className = `h-1.5 rounded-full transition-all duration-500 bg-red-500${indeterminate ? ' animate-pulse' : ''}`;
       bar.style.width = indeterminate ? '100%' : `${pct}%`;
     }
-    if (label) label.textContent = isPending ? verbs.queued : verbs.active;
+    if (label) label.textContent = isPending ? verbs.queued : (job.current_step || verbs.active);
     if (pctEl) pctEl.textContent = pct > 0 ? `${pct}%` : '';
     if (items) items.textContent = job.total_items > 0 ? `${job.processed_items} / ${job.total_items} items` : 'Loading…';
   }
@@ -2355,7 +2643,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       bar.className = `h-1.5 rounded-full transition-all duration-500 bg-violet-500${indeterminate ? ' animate-pulse' : ''}`;
       bar.style.width = indeterminate ? '100%' : `${pct}%`;
     }
-    if (label) label.textContent = isPush ? (isPending ? 'Push queued…' : 'Pushing…') : (isPending ? 'Pull queued…' : 'Pulling…');
+    if (label) label.textContent = isPending
+      ? (isPush ? 'Push queued…' : 'Pull queued…')
+      : (job.current_step || (isPush ? 'Pushing…' : 'Pulling…'));
     if (pctEl) pctEl.textContent = pct > 0 ? `${pct}%` : '';
     if (items) items.textContent = job.total_items > 0 ? `${job.processed_items} / ${job.total_items} items` : 'Loading…';
   }
@@ -2785,18 +3075,20 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
     if (!token) return;
     const traktConnected = !!document.getElementById('trakt-disconnect-btn');
     const simklConnected = !!document.getElementById('simkl-disconnect-btn');
+    const wetrakrConnected = !!document.getElementById('wetrakr-disconnect-btn');
     const mdblistConfigured = !!document.getElementById('mdblist_api_key')?.value;
     const radarrConfigured = !!document.getElementById('radarr_url')?.value;
     const sonarrConfigured = !!document.getElementById('sonarr_url')?.value;
     const mediaServerIds = Array.from(document.querySelectorAll<HTMLElement>('[data-connection-id]'))
       .map(el => el.getAttribute('data-connection-id'))
       .filter(Boolean) as string[];
-    if (!radarrConfigured && !sonarrConfigured && !traktConnected && !simklConnected && !mdblistConfigured && mediaServerIds.length === 0) return;
+    if (!radarrConfigured && !sonarrConfigured && !traktConnected && !simklConnected && !wetrakrConnected && !mdblistConfigured && mediaServerIds.length === 0) return;
 
     if (radarrConfigured) setConnStatus('radarr-conn-status', 'checking');
     if (sonarrConfigured) setConnStatus('sonarr-conn-status', 'checking');
     if (traktConnected) setConnStatus('trakt-conn-status', 'checking');
     if (simklConnected) setConnStatus('simkl-conn-status', 'checking');
+    if (wetrakrConnected) setConnStatus('wetrakr-conn-status', 'checking');
     if (mdblistConfigured) setConnStatus('mdblist-conn-status', 'checking');
     for (const id of mediaServerIds) setConnStatus(`conn-status-${id}`, 'checking');
 
@@ -2818,7 +3110,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
           })), currentFolder);
           populateSelect('radarr_quality_profile', data.radarr.quality_profiles ?? [], currentProfile);
           const tagContainer = document.getElementById('radarr_tags_list');
-          const selectedTags = Array.from(tagContainer?.querySelectorAll('input[name="radarr_tags"]') ?? []).map(i => parseInt(i.value));
+          const selectedTags = Array.from(tagContainer?.querySelectorAll('input[name="radarr_tags"]') ?? [])
+            .filter(i => i.type !== 'checkbox' || i.checked)
+            .map(i => parseInt(i.value));
           renderTags('radarr_tags_list', data.radarr.tags, selectedTags, 'radarr');
         }
       }
@@ -2833,7 +3127,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
           })), currentFolder);
           populateSelect('sonarr_quality_profile', data.sonarr.quality_profiles ?? [], currentProfile);
           const tagContainer = document.getElementById('sonarr_tags_list');
-          const selectedTags = Array.from(tagContainer?.querySelectorAll('input[name="sonarr_tags"]') ?? []).map(i => parseInt(i.value));
+          const selectedTags = Array.from(tagContainer?.querySelectorAll('input[name="sonarr_tags"]') ?? [])
+            .filter(i => i.type !== 'checkbox' || i.checked)
+            .map(i => parseInt(i.value));
           renderTags('sonarr_tags_list', data.sonarr.tags, selectedTags, 'sonarr');
         }
       }
@@ -2842,6 +3138,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       }
       if (data.simkl?.configured) {
         setConnStatus('simkl-conn-status', data.simkl.connected ? 'connected' : 'disconnected');
+      }
+      if (data.wetrakr?.configured) {
+        setConnStatus('wetrakr-conn-status', data.wetrakr.connected ? 'connected' : 'disconnected');
       }
       if (data.mdblist?.configured) {
         setConnStatus('mdblist-conn-status', data.mdblist.connected ? 'connected' : 'disconnected');
@@ -3154,8 +3453,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
               })(),
             };
             const traktSyncKeys = [
-              'trakt_sync_watched', 'trakt_sync_ratings', 'trakt_sync_lists', 'trakt_watchlist_split',
-              'trakt_push_watched', 'trakt_push_ratings', 'trakt_push_collection', 'trakt_push_lists', 'trakt_scrobble',
+              'trakt_sync_watched', 'trakt_sync_ratings', 'trakt_sync_lists', 'trakt_sync_dropped', 'trakt_watchlist_split',
+              'trakt_push_watched', 'trakt_push_ratings', 'trakt_push_collection', 'trakt_push_lists', 'trakt_push_dropped', 'trakt_scrobble',
+              'trakt_show_comments',
             ];
             for (const key of traktSyncKeys) {
               const el = document.getElementById(key) as HTMLInputElement | null;
@@ -3203,6 +3503,36 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
             }
             showMessage('Simkl settings saved.');
             return;
+          } else if (action === 'save_wetrakr_settings') {
+            const body: Record<string, any> = {
+              wetrakr_auto_sync_interval: (() => {
+                const v = (document.querySelector('[name="wetrakr_auto_sync_interval"]') as HTMLSelectElement)?.value;
+                return v ? parseFloat(v) : null;
+              })(),
+              wetrakr_auto_push_interval: (() => {
+                const v = (document.querySelector('[name="wetrakr_auto_push_interval"]') as HTMLSelectElement)?.value;
+                return v ? parseFloat(v) : null;
+              })(),
+            };
+            const wetrakrSyncKeys = [
+              'wetrakr_sync_watched', 'wetrakr_sync_ratings', 'wetrakr_sync_lists', 'wetrakr_sync_comments',
+              'wetrakr_push_watched', 'wetrakr_push_ratings', 'wetrakr_push_lists', 'wetrakr_push_comments',
+            ];
+            for (const key of wetrakrSyncKeys) {
+              const el = document.getElementById(key) as HTMLInputElement | null;
+              if (el) body[key] = el.checked;
+            }
+            const wetrakrRes = await fetch('/api/proxy/auth/settings', {
+              method: 'PATCH',
+              headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+            });
+            if (!wetrakrRes.ok) {
+              const err = await wetrakrRes.json();
+              throw new Error(err.detail || 'Failed to save WeTrakr settings');
+            }
+            showMessage('WeTrakr settings saved.');
+            return;
           } else if (action === 'save_mdblist_settings') {
             const body: Record<string, any> = {
               mdblist_api_key: (document.getElementById('mdblist_api_key') as HTMLInputElement)?.value || null,
@@ -3216,8 +3546,8 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
               })(),
             };
             const mdblistSyncKeys = [
-              'mdblist_sync_watched', 'mdblist_sync_ratings', 'mdblist_sync_watchlist',
-              'mdblist_push_watched', 'mdblist_push_ratings', 'mdblist_push_watchlist', 'mdblist_push_collection', 'mdblist_scrobble',
+              'mdblist_sync_watched', 'mdblist_sync_ratings', 'mdblist_sync_watchlist', 'mdblist_sync_dropped',
+              'mdblist_push_watched', 'mdblist_push_ratings', 'mdblist_push_watchlist', 'mdblist_push_collection', 'mdblist_push_dropped', 'mdblist_scrobble',
             ];
             for (const key of mdblistSyncKeys) {
               const el = document.getElementById(key) as HTMLInputElement | null;
@@ -3275,7 +3605,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                 const v = (document.getElementById('radarr_quality_profile') as HTMLSelectElement)?.value;
                 return v ? parseInt(v) : null;
               })(),
-              radarr_tags: Array.from(radarrTagInputs).map((i: any) => parseInt(i.value)),
+              radarr_tags: Array.from(radarrTagInputs)
+                .filter((i: any) => i.type !== 'checkbox' || i.checked)
+                .map((i: any) => parseInt(i.value)),
               radarr_customize_on_add: (document.getElementById('radarr_customize_on_add') as HTMLInputElement)?.checked ?? false,
             };
             const radarrRes = await fetch('/api/proxy/auth/settings', {
@@ -3299,7 +3631,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                 const v = (document.getElementById('sonarr_quality_profile') as HTMLSelectElement)?.value;
                 return v ? parseInt(v) : null;
               })(),
-              sonarr_tags: Array.from(sonarrTagInputs).map((i: any) => parseInt(i.value)),
+              sonarr_tags: Array.from(sonarrTagInputs)
+                .filter((i: any) => i.type !== 'checkbox' || i.checked)
+                .map((i: any) => parseInt(i.value)),
               sonarr_season_folder: (document.getElementById('sonarr_season_folder') as HTMLInputElement)?.checked ?? true,
               sonarr_customize_on_add: (document.getElementById('sonarr_customize_on_add') as HTMLInputElement)?.checked ?? false,
             };
@@ -3448,7 +3782,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
             
             // Populate tags
             const tagContainer = document.getElementById('radarr_tags_list');
-            const selectedTags = Array.from(tagContainer.querySelectorAll('input[name="radarr_tags"]')).map(i => parseInt(i.value));
+            const selectedTags = Array.from(tagContainer.querySelectorAll('input[name="radarr_tags"]'))
+              .filter(i => i.type !== 'checkbox' || i.checked)
+              .map(i => parseInt(i.value));
             renderTags('radarr_tags_list', profData.tags, selectedTags, 'radarr');
 
             setConnStatus('radarr-conn-status', 'connected');
@@ -3485,7 +3821,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
 
             // Populate tags
             const tagContainer = document.getElementById('sonarr_tags_list');
-            const selectedTags = Array.from(tagContainer.querySelectorAll('input[name="sonarr_tags"]')).map(i => parseInt(i.value));
+            const selectedTags = Array.from(tagContainer.querySelectorAll('input[name="sonarr_tags"]'))
+              .filter(i => i.type !== 'checkbox' || i.checked)
+              .map(i => parseInt(i.value));
             renderTags('sonarr_tags_list', profData.tags, selectedTags, 'sonarr');
 
             setConnStatus('sonarr-conn-status', 'connected');
@@ -3497,6 +3835,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
               trakt_sync_watched: 'watched history',
               trakt_sync_ratings: 'ratings',
               trakt_sync_lists: 'lists',
+              trakt_sync_dropped: 'dropped shows',
             };
             const pulling: string[] = [];
             document.querySelectorAll('.sync-pref-checkbox').forEach((el: any) => {
@@ -3559,6 +3898,52 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
             );
             if (!ok) return;
             url = `/api/proxy/simkl/push`;
+          } else if (action === 'sync_wetrakr') {
+            const wetrakrPullLabels: Record<string, string> = {
+              wetrakr_sync_watched: 'watched history',
+              wetrakr_sync_ratings: 'ratings',
+              wetrakr_sync_lists: 'lists',
+              wetrakr_sync_comments: 'comments',
+            };
+            const pulling: string[] = [];
+            document.querySelectorAll('.sync-pref-checkbox').forEach((el: any) => {
+              const name = el.getAttribute('name');
+              if (name && wetrakrPullLabels[name] && el.checked) pulling.push(wetrakrPullLabels[name]);
+            });
+            const noPull = pulling.length === 0;
+            const ok = await showConfirmModal(
+              noPull ? 'Nothing to pull' : 'Pull from WeTrakr?',
+              noPull
+                ? 'Your current settings have nothing selected to pull from WeTrakr. Enable at least one option in the "WeTrakr → Scrob" section.'
+                : `This will import your ${formatList(pulling)} from WeTrakr into Scrob.`,
+              noPull ? 'Got it' : 'Pull',
+              noPull
+            );
+            if (!ok) return;
+            url = `/api/proxy/wetrakr/sync`;
+          } else if (action === 'push_wetrakr') {
+            const wetrakrPushLabels: Record<string, string> = {
+              wetrakr_push_watched: 'watched history',
+              wetrakr_push_ratings: 'ratings',
+              wetrakr_push_lists: 'lists',
+              wetrakr_push_comments: 'comments',
+            };
+            const pushing: string[] = [];
+            document.querySelectorAll('.sync-pref-checkbox').forEach((el: any) => {
+              const name = el.getAttribute('name');
+              if (name && wetrakrPushLabels[name] && el.checked) pushing.push(wetrakrPushLabels[name]);
+            });
+            const noPush = pushing.length === 0;
+            const ok = await showConfirmModal(
+              noPush ? 'Nothing to push' : 'Push to WeTrakr?',
+              noPush
+                ? 'Your current settings have nothing selected to push to WeTrakr. Enable at least one option in the "Scrob → WeTrakr" section.'
+                : `This will push your ${formatList(pushing)} from Scrob to WeTrakr. Existing data on WeTrakr may be overwritten.`,
+              noPush ? 'Got it' : 'Push',
+              noPush
+            );
+            if (!ok) return;
+            url = `/api/proxy/wetrakr/push`;
           } else if (action === 'push_trakt') {
             const traktPushLabels: Record<string, string> = {
               trakt_push_watched: 'watched history',
@@ -3587,6 +3972,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
               mdblist_sync_watched: 'watched history',
               mdblist_sync_ratings: 'ratings',
               mdblist_sync_watchlist: 'watchlist',
+              mdblist_sync_dropped: 'dropped shows',
             };
             const selected = Array.from(document.querySelectorAll<HTMLInputElement>('.sync-pref-checkbox'))
               .filter(el => el.checked && labels[el.name])
@@ -3639,11 +4025,12 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
 
           if (res.ok) {
             const showsProgressBar = !!syncConnId || [
-              'sync_trakt', 'full_sync_trakt', 'push_trakt', 'sync_simkl', 'push_simkl', 'sync_mdblist', 'push_mdblist',
+              'sync_trakt', 'full_sync_trakt', 'push_trakt', 'sync_simkl', 'push_simkl', 'sync_wetrakr', 'push_wetrakr', 'sync_mdblist', 'push_mdblist',
             ].includes(action);
             showMessage(data.message || 'Action successful!', 'success', { scroll: !showsProgressBar });
             if (syncConnId) startConnPoller(syncConnId);
             if (action === 'sync_simkl' || action === 'push_simkl') startSimklPoller();
+            if (action === 'sync_wetrakr' || action === 'push_wetrakr') startWetrakrPoller();
             if (action === 'sync_trakt' || action === 'full_sync_trakt' || action === 'push_trakt') startTraktPoller();
             if (action === 'sync_mdblist' || action === 'push_mdblist') startMdblistPoller();
           } else {
@@ -4001,6 +4388,17 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       const connectBtn = document.getElementById('simkl-connect-btn');
       const disconnectBtn = document.getElementById('simkl-disconnect-btn');
 
+      // A server error can come back as plain text ("Internal Server Error"),
+      // which would make res.json() throw an unreadable JSON parse error.
+      const errorDetail = async (r: Response, fallback: string): Promise<string> => {
+        try {
+          const body = await r.json();
+          return body.detail || fallback;
+        } catch {
+          return `${fallback} (server error ${r.status})`;
+        }
+      };
+
       if (connectBtn) {
         connectBtn.onclick = async () => {
           connectBtn.disabled = true;
@@ -4016,8 +4414,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                 body: JSON.stringify({ simkl_client_id: clientId }),
               });
               if (!saveRes.ok) {
-                const err = await saveRes.json();
-                throw new Error(err.detail || 'Failed to save Simkl Client ID');
+                throw new Error(await errorDetail(saveRes, 'Failed to save Simkl Client ID'));
               }
             }
 
@@ -4026,8 +4423,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
               headers: { 'Authorization': `Bearer ${token}` },
             });
             if (!res.ok) {
-              const err = await res.json();
-              throw new Error(err.detail || 'Failed to start Simkl auth');
+              throw new Error(await errorDetail(res, 'Failed to start Simkl auth'));
             }
             const data = await res.json();
 
@@ -4062,8 +4458,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
                     return;
                   }
                 } else {
-                  const err = await pollRes.json();
-                  if (statusEl) statusEl.textContent = `Error: ${err.detail || 'Authorization failed'}`;
+                  if (statusEl) statusEl.textContent = `Error: ${await errorDetail(pollRes, 'Authorization failed')}`;
                   connectBtn.disabled = false;
                   connectBtn.textContent = 'Connect Simkl';
                   return;
@@ -4100,6 +4495,96 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       }
     }
     setupSimklAuth();
+
+    function setupWetrakrAuth() {
+      const connectBtn = document.getElementById('wetrakr-connect-btn');
+      const disconnectBtn = document.getElementById('wetrakr-disconnect-btn');
+
+      if (connectBtn) {
+        connectBtn.onclick = async () => {
+          connectBtn.disabled = true;
+          connectBtn.textContent = 'Starting…';
+          try {
+            // No client_id/secret to save — Scrob ships a single app-owned key.
+            const res = await fetch('/api/proxy/wetrakr/auth/device/start', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${token}` },
+            });
+            if (!res.ok) {
+              const err = await res.json();
+              throw new Error(err.detail || 'Failed to start WeTrakr auth');
+            }
+            const data = await res.json();
+
+            const panel   = document.getElementById('wetrakr-auth-panel');
+            const urlEl    = document.getElementById('wetrakr-verify-url');
+            const codeEl   = document.getElementById('wetrakr-user-code');
+            const statusEl = document.getElementById('wetrakr-auth-status');
+            if (panel)  panel.classList.remove('hidden');
+            if (urlEl)  urlEl.textContent = data.verification_url;
+            if (codeEl) codeEl.textContent = data.user_code;
+            connectBtn.textContent = 'Waiting…';
+
+            const interval = (data.interval || 5) * 1000;
+            const deadline = Date.now() + data.expires_in * 1000;
+            const poll = async () => {
+              if (Date.now() > deadline) {
+                if (statusEl) statusEl.textContent = 'Authorization timed out. Please try again.';
+                connectBtn.disabled = false;
+                connectBtn.textContent = 'Connect WeTrakr';
+                return;
+              }
+              try {
+                const pollRes = await fetch('/api/proxy/wetrakr/auth/device/poll', {
+                  method: 'POST',
+                  headers: { 'Authorization': `Bearer ${token}` },
+                });
+                if (pollRes.ok) {
+                  const pollData = await pollRes.json();
+                  if (pollData.status === 'connected') {
+                    if (statusEl) statusEl.textContent = 'Connected! Reloading…';
+                    window.location.reload();
+                    return;
+                  }
+                } else {
+                  const err = await pollRes.json();
+                  if (statusEl) statusEl.textContent = `Error: ${err.detail || 'Authorization failed'}`;
+                  connectBtn.disabled = false;
+                  connectBtn.textContent = 'Connect WeTrakr';
+                  return;
+                }
+              } catch (e) {}
+              setTimeout(poll, interval);
+            };
+            setTimeout(poll, interval);
+          } catch (e) {
+            showMessage(e.message, 'error');
+            connectBtn.disabled = false;
+            connectBtn.textContent = 'Connect WeTrakr';
+          }
+        };
+      }
+
+      if (disconnectBtn) {
+        disconnectBtn.onclick = async () => {
+          if (!confirm('Disconnect WeTrakr? This will remove your WeTrakr tokens from Scrob.')) return;
+          disconnectBtn.disabled = true;
+          disconnectBtn.textContent = 'Disconnecting…';
+          try {
+            await fetch('/api/proxy/wetrakr/auth/disconnect', {
+              method: 'DELETE',
+              headers: { 'Authorization': `Bearer ${token}` },
+            });
+            window.location.reload();
+          } catch (e) {
+            showMessage('Failed to disconnect WeTrakr', 'error');
+            disconnectBtn.disabled = false;
+            disconnectBtn.textContent = 'Disconnect';
+          }
+        };
+      }
+    }
+    setupWetrakrAuth();
 
     // MDBList disconnect
     function setupMdblistAuth() {
@@ -4341,6 +4826,68 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
     const cancelBtn = document.getElementById('cancel-add-connection-btn');
     const connectStremioBtn = document.getElementById('connect-stremio-btn') as HTMLButtonElement | null;
     let stremioPollTimer: number | null = null;
+
+    // Login with Plex (auto-fills the URL / token / username fields)
+    const plexLoginBtn = document.getElementById('plex-login-btn') as HTMLButtonElement | null;
+    const plexServerWrap = document.getElementById('plex-login-server-wrap');
+    const plexServerSelect = document.getElementById('plex-login-server') as HTMLSelectElement | null;
+    const plexConnWrap = document.getElementById('plex-login-connection-wrap');
+    const plexConnSelect = document.getElementById('plex-login-connection') as HTMLSelectElement | null;
+    const plexLoginStatus = document.getElementById('plex-login-status');
+    let plexPollTimer: number | null = null;
+    type PlexLoginConn = { uri: string; local: boolean; relay: boolean; reachable: boolean; label: string };
+    let plexLoginServers: Array<{ name: string; machine_identifier: string; owned: boolean; url: string; token: string; connections: PlexLoginConn[] }> = [];
+
+    const setPlexStatus = (msg: string) => {
+      if (!plexLoginStatus) return;
+      plexLoginStatus.textContent = msg;
+      plexLoginStatus.classList.toggle('hidden', !msg);
+    };
+
+    const applyPlexConnection = () => {
+      const server = plexLoginServers[plexServerSelect ? plexServerSelect.selectedIndex : 0];
+      const conn = server?.connections[plexConnSelect ? plexConnSelect.selectedIndex : 0];
+      const urlEl = document.getElementById('new-conn-url') as HTMLInputElement | null;
+      if (urlEl && conn) urlEl.value = conn.uri;
+    };
+    plexConnSelect?.addEventListener('change', applyPlexConnection);
+
+    const applyPlexServer = () => {
+      const server = plexLoginServers[plexServerSelect ? plexServerSelect.selectedIndex : 0];
+      if (!server) return;
+      const tokenEl = document.getElementById('new-conn-token') as HTMLInputElement | null;
+      const machineEl = document.getElementById('new-plex-machine-id') as HTMLInputElement | null;
+      if (tokenEl) tokenEl.value = server.token;
+      if (machineEl) machineEl.value = server.machine_identifier;
+      const nameEl = document.getElementById('new-conn-name') as HTMLInputElement | null;
+      if (nameEl && !nameEl.value.trim()) nameEl.value = server.name;
+      if (plexConnSelect) {
+        plexConnSelect.innerHTML = server.connections
+          .map((c) => `<option>${esc(c.label)}${c.reachable ? ' (reachable)' : ''}</option>`)
+          .join('');
+        const recommendedIdx = Math.max(0, server.connections.findIndex((c) => c.uri === server.url));
+        plexConnSelect.selectedIndex = recommendedIdx;
+      }
+      plexConnWrap?.classList.toggle('hidden', server.connections.length <= 1);
+      applyPlexConnection();
+    };
+    plexServerSelect?.addEventListener('change', applyPlexServer);
+
+    const resetPlexLogin = () => {
+      if (plexPollTimer !== null) { window.clearTimeout(plexPollTimer); plexPollTimer = null; }
+      plexLoginServers = [];
+      plexServerWrap?.classList.add('hidden');
+      plexConnWrap?.classList.add('hidden');
+      if (plexServerSelect) plexServerSelect.innerHTML = '';
+      if (plexConnSelect) plexConnSelect.innerHTML = '';
+      setPlexStatus('');
+      for (const id of ['new-plex-auth-token', 'new-plex-account-id', 'new-plex-machine-id']) {
+        const el = document.getElementById(id) as HTMLInputElement | null;
+        if (el) el.value = '';
+      }
+      if (plexLoginBtn) { plexLoginBtn.disabled = false; plexLoginBtn.textContent = 'Login with Plex'; }
+    };
+
     if (addBtn && addForm) {
       addBtn.addEventListener('click', () => {
         addForm.classList.toggle('hidden');
@@ -4358,6 +4905,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
           connectStremioBtn.disabled = false;
           connectStremioBtn.textContent = 'Connect Stremio';
         }
+        resetPlexLogin?.();
       });
     }
 
@@ -4390,6 +4938,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       nuvioEmailRow?.classList.toggle('hidden', !(isNuvio || isArvio));
       nuvioProfileRow?.classList.toggle('hidden', !(isNuvio || isArvio));
       stremioLinkRow?.classList.toggle('hidden', !isStremio);
+      document.getElementById('new-plex-login-row')?.classList.toggle('hidden', !isPlex);
       urlRow?.classList.toggle('hidden', isStremio);
       tokenRow?.classList.toggle('hidden', isStremio);
       document.getElementById('create-connection-btn')?.classList.toggle('hidden', isStremio);
@@ -4443,6 +4992,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
           stremioPollTimer = null;
           document.getElementById('stremio-link-details')?.classList.add('hidden');
         }
+        resetPlexLogin?.();
       }
       previousType = type;
     };
@@ -4592,6 +5142,81 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       }
     });
 
+    // Login with Plex - helpers declared with the Add Connection toggle above
+    plexLoginBtn?.addEventListener('click', async () => {
+      resetPlexLogin();
+      plexLoginBtn.disabled = true;
+      plexLoginBtn.textContent = 'Starting…';
+      try {
+        const startRes = await fetch('/api/proxy/auth/plex/pin/start', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        const start = await startRes.json();
+        if (!startRes.ok) throw new Error(start.detail || 'Could not start the Plex login.');
+        window.open(start.auth_url, '_blank', 'noopener,noreferrer');
+        setPlexStatus('Waiting for you to authorize in Plex…');
+        plexLoginBtn.textContent = 'Waiting…';
+        const expiresAt = Date.now() + 14 * 60 * 1000;
+        const intervalMs = Math.max(1, Number(start.interval) || 2) * 1000;
+
+        const poll = async () => {
+          try {
+            if (Date.now() >= expiresAt) throw new Error('Plex login expired. Try again.');
+            const pollRes = await fetch('/api/proxy/auth/plex/pin/poll', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${token}` },
+            });
+            const result = await pollRes.json();
+            if (!pollRes.ok) throw new Error(result.detail || 'Plex login failed.');
+            if (result.status === 'pending') {
+              plexPollTimer = window.setTimeout(poll, intervalMs);
+              return;
+            }
+            plexPollTimer = null;
+            plexLoginServers = result.servers || [];
+            const username: string = result.account?.username || '';
+            const usernameEl = document.getElementById('new-conn-username') as HTMLInputElement | null;
+            if (usernameEl && username) usernameEl.value = username;
+            const authTokenEl = document.getElementById('new-plex-auth-token') as HTMLInputElement | null;
+            if (authTokenEl) authTokenEl.value = result.auth_token || '';
+            const accountIdEl = document.getElementById('new-plex-account-id') as HTMLInputElement | null;
+            if (accountIdEl) accountIdEl.value = result.account?.id || '';
+
+            if (!plexLoginServers.length) {
+              setPlexStatus(`Signed in as ${username || 'your Plex account'}, but no reachable servers were found. Enter the server URL and token manually.`);
+              plexLoginBtn.disabled = false;
+              plexLoginBtn.textContent = 'Login with Plex';
+              return;
+            }
+            if (plexServerSelect) {
+              plexServerSelect.innerHTML = plexLoginServers
+                .map((s, i) => `<option value="${i}">${esc(s.name)}${s.owned ? '' : ' (shared)'}</option>`)
+                .join('');
+            }
+            plexServerWrap?.classList.remove('hidden');
+            applyPlexServer();
+            setPlexStatus(`Signed in as ${username || 'your Plex account'}. Pick a server, then press Add.`);
+            plexLoginBtn.disabled = false;
+            plexLoginBtn.textContent = 'Use a different account';
+          } catch (error: any) {
+            plexPollTimer = null;
+            setPlexStatus(error.message);
+            showMessage(error.message, 'error');
+            plexLoginBtn.disabled = false;
+            plexLoginBtn.textContent = 'Login with Plex';
+          }
+        };
+        plexPollTimer = window.setTimeout(poll, intervalMs);
+      } catch (error: any) {
+        plexPollTimer = null;
+        setPlexStatus(error.message);
+        showMessage(error.message, 'error');
+        plexLoginBtn.disabled = false;
+        plexLoginBtn.textContent = 'Login with Plex';
+      }
+    });
+
     // Test new connection button
     const testNewBtn = document.getElementById('test-new-connection-btn');
     if (testNewBtn) {
@@ -4670,8 +5295,17 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
               return value ? parseFloat(value) : null;
             })(),
           };
-          if (type === 'plex') body.server_username = username;
-          else body.server_user_id = userId;
+          if (type === 'plex') {
+            body.server_username = username;
+            const authTok = (document.getElementById('new-plex-auth-token') as HTMLInputElement)?.value.trim();
+            const acctId = (document.getElementById('new-plex-account-id') as HTMLInputElement)?.value.trim();
+            const machineId = (document.getElementById('new-plex-machine-id') as HTMLInputElement)?.value.trim();
+            if (authTok) body.plex_auth_token = authTok;
+            if (acctId) body.plex_account_id = acctId;
+            if (machineId) body.plex_machine_identifier = machineId;
+          } else {
+            body.server_user_id = userId;
+          }
 
           const res = await fetch('/api/proxy/auth/connections', {
             method: 'POST',
@@ -4901,6 +5535,37 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
     }
   }
 
+  function setupConnectedApps() {
+    document.querySelectorAll<HTMLButtonElement>('.revoke-grant-btn').forEach((btn) => {
+      if (btn.dataset.bound) return;
+      btn.dataset.bound = '1';
+      btn.addEventListener('click', async () => {
+        const row = btn.closest('li');
+        const id = row?.getAttribute('data-grant-id');
+        if (!id || btn.disabled) return;
+        btn.disabled = true;
+        btn.textContent = 'Revoking…';
+        try {
+          const res = await fetch(`/api/proxy/auth/device/grants/${id}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${token}` },
+          });
+          if (!res.ok) throw new Error();
+          row?.remove();
+          const list = document.getElementById('device-grants-list');
+          if (list && list.querySelectorAll('li[data-grant-id]').length === 0) {
+            list.innerHTML = '<li class="text-sm text-zinc-500 border border-zinc-800 rounded-lg px-4 py-3">No connected apps.</li>';
+          }
+          showMessage('Connected app revoked.');
+        } catch {
+          btn.disabled = false;
+          btn.textContent = 'Revoke';
+          showMessage('Failed to revoke connected app', 'error');
+        }
+      });
+    });
+  }
+
   function setupCollapsibleRows() {
     document.querySelectorAll('.collapsible-header').forEach(header => {
       header.addEventListener('click', () => {
@@ -4968,7 +5633,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
     try {
       // Remember which warning detail panes are currently open so we can restore them after rebuild
       const expandedDetails = new Set<string>();
-      document.querySelectorAll('[id^="conn-warnings-details-"]').forEach(el => {
+      document.querySelectorAll('[id^="conn-warnings-details-"], [id^="conn-warnings-lookup-"]').forEach(el => {
         if (!el.classList.contains('hidden')) expandedDetails.add(el.id);
       });
 
@@ -4994,20 +5659,40 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
         overrideMap.set(`${o.source_show_tmdb_id}:${o.source_season_number}`, o);
       }
 
+      const formatJobDate = (job: any) => {
+        const raw = job.updated_at as string;
+        const stamped = raw.endsWith('Z') || raw.includes('+') ? raw : raw + 'Z';
+        return new Date(stamped).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
+      };
+
+      // Pull unmatched-TMDB / enrichment vs push lookup-failed must not share a
+      // job: the latest completed job with warnings used to be the Push, which
+      // hid real Pull unmatched rows and painted lookup misses as Match-to-TMDB (#304).
+      const latestJobFor = (connId: string, push: boolean) =>
+        jobs.find((j: any) =>
+          String(j.connection_id) === connId
+          && j.status === 'completed'
+          && j.warnings?.length > 0
+          && (push ? j.job_type === 'push' : j.job_type === 'pull')
+        );
+
       // Find all connection warning containers on the page
-      const containers = document.querySelectorAll<HTMLElement>('[id^="conn-warnings-"]');
+      const containers = document.querySelectorAll<HTMLElement>('[id^="conn-warnings-"]:not([id*="details-"]):not([id*="lookup-"])');
       containers.forEach(container => {
         const connId = container.id.replace('conn-warnings-', '');
-        const job = jobs.find(j => String(j.connection_id) === connId && j.status === 'completed' && j.warnings?.length > 0);
-        if (!job) { container.classList.add('hidden'); container.innerHTML = ''; return; }
+        const pullJob = latestJobFor(connId, false);
+        const pushJob = latestJobFor(connId, true);
+        const pullWarnings: any[] = pullJob?.warnings ?? [];
+        const lookupWarnings: any[] = (pushJob?.warnings ?? []).filter((w: any) => w.type === 'watched_lookup_failed');
+        if (!pullJob && lookupWarnings.length === 0) { container.classList.add('hidden'); container.innerHTML = ''; return; }
 
-        const warnings: any[] = job.warnings;
-        const _updatedAt = job.updated_at.endsWith('Z') || job.updated_at.includes('+') ? job.updated_at : job.updated_at + 'Z';
-        const date = new Date(_updatedAt).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
+        const date = pullJob ? formatJobDate(pullJob) : '';
+        const pushDate = pushJob ? formatJobDate(pushJob) : '';
         const detailsId = `conn-warnings-details-${connId}`;
+        const lookupDetailsId = `conn-warnings-lookup-${connId}`;
 
-        const enrichmentWarnings = warnings.filter((w: any) => w.tmdb_id !== undefined && w.season !== undefined);
-        const unmatchedWarnings = warnings.filter((w: any) => w.title !== undefined);
+        const enrichmentWarnings = pullWarnings.filter((w: any) => w.tmdb_id !== undefined && w.season !== undefined);
+        const unmatchedWarnings = pullWarnings.filter((w: any) => w.title !== undefined && w.type !== 'watched_lookup_failed');
 
         const renderEnrichment = enrichmentWarnings.length > 0 ? `
           <div class="space-y-1">
@@ -5156,8 +5841,14 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
           </div>
         ` : '';
 
-        container.classList.remove('hidden');
-        container.innerHTML = `
+        const hasPullPanel = !!pullJob && (hasUnmatched || enrichmentWarnings.length > 0);
+        const hasLookupPanel = lookupWarnings.length > 0;
+        if (!hasPullPanel && !hasLookupPanel) { container.classList.add('hidden'); container.innerHTML = ''; return; }
+
+        const warnIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-amber-400 shrink-0"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>`;
+        const chevron = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="warn-chevron w-4 h-4 text-amber-500/60 transition-transform shrink-0"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" /></svg>`;
+
+        const pullBanner = hasPullPanel ? `
           <div class="rounded-xl border border-amber-500/20 bg-amber-500/5 overflow-hidden">
             <button
               type="button"
@@ -5165,25 +5856,88 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
               onclick="const d=document.getElementById('${detailsId}');const c=this.querySelector('.warn-chevron');d.classList.toggle('hidden');c.classList.toggle('rotate-180');"
             >
               <div class="flex items-center gap-2">
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-amber-400 shrink-0"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+                ${warnIcon}
                 <span class="text-xs font-semibold uppercase tracking-wider text-amber-400">${displayCount} item${displayCount > 1 ? 's' : ''} couldn't be fully synced</span>
                 <span class="text-xs text-zinc-500">· ${escapeHtml(date)}</span>
               </div>
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="warn-chevron w-4 h-4 text-amber-500/60 transition-transform shrink-0">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
-              </svg>
+              ${chevron}
             </button>
             <div id="${detailsId}" class="hidden border-t border-amber-500/15 px-4 py-3">
               ${renderEnrichment}
               ${renderUnmatched}
             </div>
           </div>
-        `;
+        ` : '';
+
+        // Group episode lookup-failures by series_name (same reasoning as
+        // groupedEpisodeWarnings above) - a large legacy watch history
+        // against a partial library can produce thousands of these for a
+        // handful of shows, and one row per episode makes the panel
+        // unusable (#400).
+        const groupedLookupWarnings: Map<string, {count: number, reason: string}> = new Map();
+        const standaloneLookupWarnings: any[] = [];
+        for (const w of lookupWarnings) {
+          if (w.media_type === 'episode' && w.series_name) {
+            const existing = groupedLookupWarnings.get(w.series_name);
+            if (existing) existing.count++;
+            else groupedLookupWarnings.set(w.series_name, {count: 1, reason: w.reason ?? 'Not found on this server'});
+          } else {
+            standaloneLookupWarnings.push(w);
+          }
+        }
+        const lookupDisplayCount = groupedLookupWarnings.size + standaloneLookupWarnings.length;
+
+        const renderLookup = hasLookupPanel ? `
+          <div class="space-y-1">
+            <p class="text-xs text-zinc-500 mb-2">Watch history that has no matching item in this library. Nothing was marked watched here - this is not an unmatched TMDB title.</p>
+            ${[...groupedLookupWarnings.entries()].map(([seriesName, {count, reason}]) => `
+              <div class="flex items-center gap-3 py-1.5 border-b border-zinc-800/60 last:border-0">
+                <div class="flex-1 min-w-0">
+                  <span class="text-sm text-zinc-200 font-medium">${escapeHtml(seriesName)}</span>
+                  <span class="ml-2 text-xs text-zinc-600">${count} episode${count !== 1 ? 's' : ''}</span>
+                  <p class="text-xs text-zinc-500 mt-0.5">${escapeHtml(reason)}</p>
+                </div>
+              </div>`).join('')}
+            ${standaloneLookupWarnings.map((w: any) => `
+              <div class="flex items-center gap-3 py-1.5 border-b border-zinc-800/60 last:border-0">
+                <div class="flex-1 min-w-0">
+                  <span class="text-sm text-zinc-200 font-medium">${escapeHtml(w.title ?? 'Untitled')}</span>
+                  ${w.media_type ? `<span class="ml-2 text-xs text-zinc-600">${escapeHtml(w.media_type)}</span>` : ''}
+                  <p class="text-xs text-zinc-500 mt-0.5">${escapeHtml(w.reason ?? 'Not found on this server')}</p>
+                </div>
+              </div>`).join('')}
+          </div>
+        ` : '';
+
+        const lookupBanner = hasLookupPanel ? `
+          <div class="rounded-xl border border-amber-500/20 bg-amber-500/5 overflow-hidden">
+            <button
+              type="button"
+              class="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-amber-500/10 transition-colors cursor-pointer"
+              onclick="const d=document.getElementById('${lookupDetailsId}');const c=this.querySelector('.warn-chevron');d.classList.toggle('hidden');c.classList.toggle('rotate-180');"
+            >
+              <div class="flex items-center gap-2">
+                ${warnIcon}
+                <span class="text-xs font-semibold uppercase tracking-wider text-amber-400">${lookupDisplayCount} watched item${lookupDisplayCount !== 1 ? 's' : ''} not found on this server${lookupWarnings.length !== lookupDisplayCount ? ` (${lookupWarnings.length} episodes)` : ''}</span>
+                <span class="text-xs text-zinc-500">· ${escapeHtml(pushDate)}</span>
+              </div>
+              ${chevron}
+            </button>
+            <div id="${lookupDetailsId}" class="hidden border-t border-amber-500/15 px-4 py-3">
+              ${renderLookup}
+            </div>
+          </div>
+        ` : '';
+
+        container.classList.remove('hidden');
+        container.innerHTML = `<div class="space-y-2">${pullBanner}${lookupBanner}</div>`;
 
         // Restore expanded state if this pane was open before the rebuild
-        if (expandedDetails.has(detailsId)) {
-          document.getElementById(detailsId)?.classList.remove('hidden');
-          container.querySelector('.warn-chevron')?.classList.add('rotate-180');
+        for (const id of [detailsId, lookupDetailsId]) {
+          if (!expandedDetails.has(id)) continue;
+          const pane = document.getElementById(id);
+          pane?.classList.remove('hidden');
+          pane?.previousElementSibling?.querySelector('.warn-chevron')?.classList.add('rotate-180');
         }
 
         container.querySelectorAll('.remap-season-btn').forEach((btn) => {
@@ -5288,7 +6042,11 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
     let srcSeason = 0;
     let targetTmdbId = 0;
     let targetTvdbId = 0;
-    let targetSeasonNumber = 0;
+    // null = nothing picked yet, distinct from a legitimately-selected Season 0
+    // (TVDB stores specials/OVAs there for many anime - see #363). 0 is falsy
+    // in JS, so a plain `!targetSeasonNumber` check would reject it even once
+    // it's selected.
+    let targetSeasonNumber: number | null = null;
     let modalMode: 'remap' | 'match' | 'match-movie' = 'remap';
     let matchSeriesName = '';
     let matchMovieTitle = '';
@@ -5307,7 +6065,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       (document.getElementById('remap-error') as HTMLElement).classList.add('hidden');
       targetTmdbId = 0;
       targetTvdbId = 0;
-      targetSeasonNumber = 0;
+      targetSeasonNumber = null;
       modalMode = 'remap';
       matchSeriesName = '';
       matchMovieTitle = '';
@@ -5359,7 +6117,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       (document.getElementById('remap-save') as HTMLButtonElement).disabled = true;
       targetTmdbId = 0;
       targetTvdbId = 0;
-      targetSeasonNumber = 0;
+      targetSeasonNumber = null;
     });
 
     const searchInput = document.getElementById('remap-search-input') as HTMLInputElement;
@@ -5391,7 +6149,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
           targetTmdbId = tmdbId;
           targetTvdbId = 0;
         }
-        targetSeasonNumber = 0;
+        targetSeasonNumber = null;
         (document.getElementById('remap-selected-poster') as HTMLImageElement).src = btn.dataset.poster ?? '';
         (document.getElementById('remap-selected-title') as HTMLElement).textContent = btn.dataset.title ?? '';
         (document.getElementById('remap-selected-year') as HTMLElement).textContent = btn.dataset.year ?? '';
@@ -5423,7 +6181,9 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
             headers: { 'Authorization': `Bearer ${token}` },
           });
           const showData = showRes.ok ? await showRes.json() : null;
-          const seasons: any[] = (showData?.seasons_meta ?? []).filter((s: any) => s.season_number > 0);
+          // >= 0, not > 0 - TVDB stores specials/OVAs in Season 0 for a lot of
+          // anime, and that's a legitimate remap target (#363).
+          const seasons: any[] = (showData?.seasons_meta ?? []).filter((s: any) => s.season_number >= 0);
           seasonsLoading.classList.add('hidden');
           if (!seasons.length) {
             seasonsList.innerHTML = '<p class="text-xs text-zinc-500 py-1">No seasons found.</p>';
@@ -5478,13 +6238,24 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
         }
         resultsEl.innerHTML = results.map((r: any) => {
           const year = escapeHtml(String(r.release_date ?? r.first_air_date ?? '').slice(0, 4));
+          // Same rationale as the TVDB results below (#364) - an exact-title
+          // remake/reboot is otherwise indistinguishable, especially when
+          // TMDB hasn't got a release/air date on record yet. TMDB has no
+          // network/status on a search result the way TVDB does, but the id
+          // is always there, and original_title catches e.g. a dub sharing
+          // its English title with an unrelated show.
+          const subtitle = [
+            year || null,
+            `TMDB ${r.tmdb_id}`,
+            r.original_title && r.original_title !== r.title ? escapeHtml(r.original_title) : null,
+          ].filter(Boolean).join(' · ');
           return `
           <button type="button" class="remap-result w-full flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-zinc-800 transition-colors cursor-pointer text-left"
             data-tmdb="${r.tmdb_id}" data-title="${escapeHtml(r.title ?? '')}" data-year="${year}" data-poster="${escapeHtml(r.poster_path ?? '')}">
             <img src="${escapeHtml(r.poster_path ?? '')}" alt="" class="w-8 h-11 object-cover rounded bg-zinc-700 shrink-0" onerror="this.style.display='none'" />
             <div class="flex-1 min-w-0">
               <p class="text-sm text-zinc-100 truncate">${escapeHtml(r.title ?? '')}</p>
-              <p class="text-xs text-zinc-500">${year}</p>
+              <p class="text-xs text-zinc-500">${subtitle}</p>
             </div>
           </button>`;
         }).join('');
@@ -5520,15 +6291,27 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
           resultsEl.innerHTML = '<p class="text-xs text-zinc-500 py-2">No results found on TVDB.</p>';
           return;
         }
-        resultsEl.innerHTML = results.slice(0, 8).map((r: any) => `
+        resultsEl.innerHTML = results.slice(0, 8).map((r: any) => {
+          // A blank/missing year plus an identical title (remakes/reboots
+          // sharing a name, e.g. Ranma 1/2) makes two results indistinguishable
+          // - the TVDB id is always shown so there's an unambiguous fallback
+          // to pick the right one by (#364).
+          const subtitle = [
+            r.year ? escapeHtml(String(r.year)) : null,
+            `TVDB ${r.tvdb_id}`,
+            r.network ? escapeHtml(r.network) : null,
+            r.status ? escapeHtml(r.status) : null,
+          ].filter(Boolean).join(' · ');
+          return `
           <button type="button" class="remap-result w-full flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-zinc-800 transition-colors cursor-pointer text-left"
             data-tvdb="${r.tvdb_id}" data-title="${escapeHtml(r.title ?? '')}" data-year="${escapeHtml(String(r.year ?? ''))}" data-poster="${escapeHtml(r.image_url ?? '')}">
             <img src="${escapeHtml(r.image_url ?? '')}" alt="" class="w-8 h-11 object-cover rounded bg-zinc-700 shrink-0" onerror="this.style.display='none'" />
             <div class="flex-1 min-w-0">
               <p class="text-sm text-zinc-100 truncate">${escapeHtml(r.title ?? '')}</p>
-              <p class="text-xs text-zinc-500">${escapeHtml(String(r.year ?? ''))}${r.network ? ` · ${escapeHtml(r.network)}` : ''}</p>
+              <p class="text-xs text-zinc-500">${subtitle}</p>
             </div>
-          </button>`).join('');
+          </button>`;
+        }).join('');
         resultsEl.querySelectorAll('.remap-result').forEach(btn => wireResultClick(btn as HTMLElement));
       } catch (e: any) {
         resultsEl.innerHTML = `<p class="text-xs text-red-400 py-2">Search failed: ${escapeHtml(e.message ?? '')}</p>`;
@@ -5592,7 +6375,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
       }
 
       // Remap mode
-      if ((!targetTmdbId && !targetTvdbId) || !targetSeasonNumber) return;
+      if ((!targetTmdbId && !targetTvdbId) || targetSeasonNumber === null) return;
       saveBtn.textContent = 'Saving…';
       try {
         const remapBody: any = {
@@ -5689,6 +6472,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
   setupScrobbleConnections();
   setupSettingsForm();
   setupApiKey();
+  setupConnectedApps();
   setupCollapsibleRows();
   checkConnections();
   loadSyncWarnings();
@@ -5701,6 +6485,7 @@ const sonarrConfigured   = !!(settings.sonarr_url && settings.sonarr_token);
     setupConnections();
     setupSettingsForm();
     setupApiKey();
+    setupConnectedApps();
     setupCollapsibleRows();
     checkConnections();
     loadSyncWarnings();
