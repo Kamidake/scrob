@@ -8,9 +8,6 @@ RUN npm ci
 COPY frontend/ .
 RUN npm run build && npm prune --omit=dev
 
-# Runtime needs only the production dependencies
-RUN npm prune --omit=dev
-
 # ── Stage 2: Runtime (Python + Node + supervisord + embedded PostgreSQL) ──────
 FROM python:3.12-alpine
 
@@ -67,7 +64,7 @@ RUN chmod +x /entrypoint.sh /entrypoint.omnibus.sh
 # Persistent data lives here — mount a volume over both paths
 VOLUME ["/app/backend/data", "/app/postgres/data"]
 
-EXPOSE 7330
+EXPOSE 5000
 
 # Requires Docker Engine 25+ for --start-interval
 HEALTHCHECK --interval=2m --timeout=2s --start-period=20s --start-interval=5s --retries=3 \
